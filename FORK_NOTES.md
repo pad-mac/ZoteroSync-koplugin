@@ -1,7 +1,31 @@
 # Zotero Atelier — fork notes
 
 Source project: https://github.com/Atelier-Recherche/zoteroatelier.koplugin
-This fork: v0.8, 2026-10-03 (GPL-3.0, like the original).
+This fork: v0.8.1, 2026-10-03 (GPL-3.0, like the original).
+
+## v0.8.1
+
+* **Entries with a link among their attachments.** Tapping an entry opened
+  its first PDF, or else its *last* attachment by name, whatever that was.
+  With a "Google Books Link" (or any other link to a web page) sorting last,
+  the answer was an error although an EPUB or a snapshot was there. Now the
+  entry opens its file: PDF before EPUB before web snapshot; links are never
+  candidates. If it has several files of the best kind (two PDFs), a short
+  list asks which. An entry with links only says so.
+* Links are no longer tried by the offline-collection download (they showed
+  up as "Attachment download errors" after every sync).
+* The entry details (long-press) label links as links, and no longer fail
+  for entries without an abstract (standalone notes).
+* Web snapshots made of several files (older snapshots), which Zotero stores
+  as a zip, are unpacked after the download. Zip archives are now unpacked
+  with KOReader's own library; the WebDAV download relied on an `unzip`
+  program that Android devices do not have.
+* **Sync that seems to wait for a touch.** While a sync runs, the plugin now
+  asks Android to keep the screen on (the user's screen timeout is put back
+  afterwards). Onyx devices are known to put the processor to sleep when
+  nothing is touched, which stops timers and network traffic. Whether this
+  flag is enough on a given Boox cannot be tested here; if not, the Boox's own
+  power settings for KOReader are the place to look.
 
 ## v0.8 — reading position
 

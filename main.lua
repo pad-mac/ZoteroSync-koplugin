@@ -261,6 +261,52 @@ function ZoteroBrowser:openAttachment(key)
         end
     end)
 end
+local KIND_LABEL = { pdf = "PDF", epub = "EPUB", html = _("Web snapshot") }
+
+--- An entry was tapped: open its file. Links to web pages (a Google Books
+-- link, say) are not files and are passed over; if the entry has several
+-- files of the same kind, the user chooses.
+function ZoteroBrowser:openItem(key, title)
+    local attachments = ZoteroAPI.getItemAttachments(key)
+    if attachments == nil or table_empty(attachments) then
+        UIManager:show(InfoMessage:new({
+            text = _("The selected entry does not have any attachments."),
+            timeout = 5,
+            icon = "notice-warning",
+        }))
+        return
+    end
+    local pick, usable = ZoteroAPI.pickAttachment(key)
+    if pick then
+        self:openAttachment(pick.key)
+        return
+    end
+    if #usable == 0 then
+        UIManager:show(InfoMessage:new({
+            text = _("This entry has no file that can be opened here (PDF, EPUB or web snapshot); its attachments are links to web pages or files of other kinds."),
+            timeout = 6,
+            icon = "notice-warning",
+        }))
+        return
+    end
+    local dialog
+    local buttons = {}
+    for __, attachment in ipairs(usable) do
+        buttons[#buttons + 1] = { {
+            text = (KIND_LABEL[attachment.kind] or "?") .. " · " .. tostring(attachment.text),
+            align = "left",
+            callback = function()
+                UIManager:close(dialog)
+                self:openAttachment(attachment.key)
+            end,
+        } }
+    end
+    dialog = ButtonDialog:new({
+        title = title and (tostring(title) .. "\n" .. _("Which file?")) or _("Which file?"),
+        buttons = buttons,
+    })
+    UIManager:show(dialog)
+end
 function ZoteroBrowser:onMenuSelect(item)
     if item.type == "collection" then
         table.insert(self.paths, item.text)
@@ -271,27 +317,7 @@ function ZoteroBrowser:onMenuSelect(item)
         table.insert(self.keys, "all")
         self:displaySearchResults("")
     elseif item.type == "item" then
-        local attachments = ZoteroAPI.getItemAttachments(item.key)
-        if attachments == nil or table_empty(attachments) then
-            UIManager:show(InfoMessage:new({
-                text = _("The selected entry does not have any attachments."),
-                timeout = 5,
-                icon = "notice-warning",
-            }))
-            return
-        end
-        local pdf_attachment = nil
-        for __, attachment in ipairs(attachments) do
-            if attachment.is_pdf then
-                pdf_attachment = attachment
-                break
-            end
-        end
-        if pdf_attachment then
-            self:openAttachment(pdf_attachment.key)
-        else
-            self:openAttachment(attachments[#attachments].key)
-        end
+        self:openItem(item.key, item.text)
     elseif item.type == "attachment" then
         self:openAttachment(item.key)
     elseif item.type == "label" then
@@ -539,6 +565,31 @@ function Plugin:onCloseDocument()
     if not ok then logger.warn("Zotero: preparing EPUB positions failed:", tostring(err)) end
 end
 
+--- Keep the device from dozing while a sync runs. On Android the only means
+-- the reader has is its "keep screen on" window flag; the user's own screen
+-- timeout is put back afterwards. Elsewhere the reader's standby prevention
+-- (which the progress messages already use) does the job.
+local saved_screen_timeout
+local function keepAwake(on)
+    pcall(function()
+        local ok, android = pcall(require, "android")
+        if not ok or type(android) ~= "table" or type(android.timeout) ~= "table" then return end
+        local C = require("ffi").C
+        if on then
+            if saved_screen_timeout ~= nil then return end
+            if type(android.needsWakelocks) == "function" and android.needsWakelocks() then return end -- always on already
+            local current = android.timeout.get()
+            if current == C.AKEEP_SCREEN_ON_ENABLED then return end
+            saved_screen_timeout = current
+            android.timeout.set(C.AKEEP_SCREEN_ON_ENABLED)
+        elseif saved_screen_timeout ~= nil then
+            local previous = saved_screen_timeout
+            saved_screen_timeout = nil
+            android.timeout.set(previous)
+        end
+    end)
+end
+
 --- Run a sync: one at a time, online, with progress messages the user can
 -- stop, and with a message instead of silence if it fails unexpectedly.
 -- @param fn function(progress, stopped)
@@ -555,7 +606,9 @@ function Plugin:runSync(fn)
             sync_alive_at = os.time()
             Trapper:setPausedText(_("Stop the Zotero sync?"), _("Stop"), _("Continue"))
             local progress, stopped = makeProgress()
+            keepAwake(true)
             local ok, err = xpcall(function() fn(progress, stopped) end, debug.traceback)
+            keepAwake(false)
             sync_alive_at = nil
             Trapper:setPausedText(nil, nil, nil)
             if not ok then

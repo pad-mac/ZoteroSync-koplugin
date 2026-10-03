@@ -137,10 +137,9 @@ function itemInfo:show(itemDetails, attachment_callback)
     local kv_pairs = {}
 --    print("In itemInfo :", itemData["title"])
 --	print(#attachments, " attachments")
-    local type = itemData.itemType
-	if type then
-		--print(type, itemTypeStrings[type])
-		self.title = itemTypeStrings[type] or "Item information"
+    local item_type = itemData.itemType
+	if item_type then
+		self.title = itemTypeStrings[item_type] or "Item information"
 	end
 
     local key_text
@@ -174,7 +173,7 @@ function itemInfo:show(itemDetails, attachment_callback)
     end
 	-- Deal with abstract
 	local abstract = itemData.abstractNote
-	if abstract ~= "" then
+	if type(abstract) == "string" and abstract ~= "" then -- (some item types have no abstract at all)
 		if sep == 0 then
 			table.insert(kv_pairs, "--")
 			sep = sep + 1
@@ -199,11 +198,12 @@ function itemInfo:show(itemDetails, attachment_callback)
 		table.insert(kv_pairs, { "Attachents:", "...tap to open..."	})
 		local cb
 		for i, v in ipairs(attachments) do
-			key_text = "["..i.."] ("..mimeTypes[v.contentType].."):"
+			-- v.kind: what the reader can open; nil for a link to a web page
+			local label = v.kind or (v.linkMode == "linked_url" and "link") or mimeTypes[v.contentType] or "file"
+			key_text = "["..i.."] ("..label.."):"
 			if attachment_callback then
 				cb = function() attachment_callback(v.key) end
 			else
-				print("No cb supplied?")
 				cb = nil
 			end
 			local vtext

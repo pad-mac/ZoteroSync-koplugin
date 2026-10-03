@@ -12,7 +12,7 @@ local Util = require("zotero_util")
 local _ = require("gettext")
 local DocSettings = require("docsettings")
 
-local API = { version = "Zotero Atelier 2.0 fork v0.8 (2026-10-03)", fork = "0.6" }
+local API = { version = "Zotero Atelier 2.0 fork v0.8.1 (2026-10-03)", fork = "0.6" }
 -- what a sync that the user stopped reports
 API.CANCELLED = "Sync stopped."
 local ZOTERO_BASE_URL = "https://api.zotero.org"
@@ -460,6 +460,24 @@ function API.resolveLinkedPath(raw, linkedBase, mappings, strict, for_key)
 end
 function API.isSupportedAttachmentLinkMode(mode) return SUPPORTED_LINK_MODES[mode] == true end
 
+local TYPE_KIND = { ["application/pdf"] = "pdf", ["application/epub+zip"] = "epub", ["text/html"] = "html", ["application/xhtml+xml"] = "html" }
+local EXT_KIND = { pdf = "pdf", epub = "epub", html = "html", htm = "html", xhtml = "html" }
+--- What the reader can open of an attachment: "pdf", "epub", "html" - or nil
+-- for a link to a web page (Zotero's "linked URL", such as a Google Books
+-- link) and for files of other kinds.
+-- @param d the attachment's data
+function API.attachmentKind(d)
+    if type(d) ~= "table" or not SUPPORTED_LINK_MODES[d.linkMode] then return nil end
+    local kind = TYPE_KIND[d.contentType]
+    if not kind and (d.contentType == nil or d.contentType == "" or d.contentType == "application/octet-stream") then
+        -- no usable content type: go by the file name
+        local name = d.filename or API.basenameOfPath(d.path) or ""
+        kind = EXT_KIND[(tostring(name):match("%.(%w+)$") or ""):lower()]
+    end
+    return kind
+end
+local KIND_ORDER = { pdf = 1, epub = 2, html = 3 }
+
 function API.getDirAndPath(item)
     if not item or not item.data or not item.key then return nil, nil end
     local dir = BaseUtil.joinPath(API.storage_dir, item.key)
@@ -525,7 +543,7 @@ function API.getFirstLocalPathPreview()
     local row = stmt:reset():step()
     while row do
         local item = safe_decode(row[1])
-        if item and item.data and API.isSupportedAttachmentLinkMode(item.data.linkMode) and table_contains(SUPPORTED_MEDIA_TYPES,item.data.contentType) then
+        if item and item.data and API.attachmentKind(item.data) then
             local p = API.probeAttachmentResolution(item)
             stmt:close(); return p
         end
@@ -650,11 +668,20 @@ function API.findAttachmentKeyByFilePath(file_path, hint)
     end
     return nil
 end
+--- Why an attachment cannot be opened, in words.
+function API.whyNotOpenable(d)
+    d=type(d)=="table" and d or {}
+    if d.linkMode=="linked_url" then return "This attachment is a link to a web page, not a file." end
+    if not SUPPORTED_LINK_MODES[d.linkMode] then return "This kind of attachment ("..tostring(d.linkMode)..") cannot be opened." end
+    local what=d.contentType
+    if what==nil or what=="" then what=d.filename or "unknown type" end
+    return "Only PDF, EPUB and web snapshots can be opened; this attachment is "..tostring(what).."."
+end
 function API.tryResolveLocalAttachment(key)
     local item=API.getItem(key)
     if not item then return nil,"Error: the requested file can not be found in the database" end
     if not item.data or item.data.itemType ~= "attachment" then return nil,"Error: this item is not an attachment" end
-    if not API.isSupportedAttachmentLinkMode(item.data.linkMode) then return nil,"Error: this item is not a supported attachment" end
+    if not API.attachmentKind(item.data) then return nil,API.whyNotOpenable(item.data) end
     local p=API.resolveAttachmentPath(item)
     if p and file_exists(p) then return p,nil end
     return nil,nil
@@ -912,7 +939,7 @@ local function relink_orphans()
     local row=st:step()
     while row do
         local item=safe_decode(row[2]); local d=item and item.data
-        if d and table_contains(SUPPORTED_MEDIA_TYPES,d.contentType) then attachments[row[1]]=d.parentItem or row[1] end
+        if d and (table_contains(SUPPORTED_MEDIA_TYPES,d.contentType) or API.attachmentKind(d)) then attachments[row[1]]=d.parentItem or row[1] end
         row=st:step(row)
     end
     st:close()
@@ -1002,7 +1029,7 @@ function API.fetchZoteroItems(since, progress_callback)
                         else
                             for __,c in ipairs(cols) do colstmt:reset():bind(c,item.key):step() end
                         end
-                        if d.itemType=="attachment" and table_contains(SUPPORTED_MEDIA_TYPES,d.contentType) then
+                        if d.itemType=="attachment" and (table_contains(SUPPORTED_MEDIA_TYPES,d.contentType) or API.attachmentKind(d)) then
                             attachments[item.key]=d.parentItem or item.key
                         elseif d.itemType=="annotation" and d.parentItem then
                             annotations[item.key]=d.parentItem
@@ -1155,7 +1182,7 @@ function API.checkItemData(progress_callback)
                 else
                     for __,c in ipairs(cols) do colstmt:reset():bind(c,item.key):step() end
                 end
-                if item.data.itemType=="attachment" and table_contains(SUPPORTED_MEDIA_TYPES,item.data.contentType) then
+                if item.data.itemType=="attachment" and (table_contains(SUPPORTED_MEDIA_TYPES,item.data.contentType) or API.attachmentKind(item.data)) then
                     attachments[item.key]=item.data.parentItem or item.key
                 end
                 if item.data.itemType=="annotation" and item.data.parentItem then
@@ -1193,13 +1220,42 @@ end
 function API.getItemAttachments(key)
     local db=API.openDB(); local stmt=db:prepare([[SELECT i.key,d.value FROM itemAttachments a JOIN items i ON i.itemID=a.itemID JOIN itemData d ON d.itemID=i.itemID WHERE a.parentItemID IN (SELECT itemID FROM items WHERE key=?) ]])
     local out={}; local row=stmt:bind(key):step()
-    while row do local item=safe_decode(row[2]); local d=item and item.data or {}; table.insert(out,{key=row[1],text=d.filename or d.title or row[1],type="attachment",is_pdf=d.contentType=="application/pdf",contentType=d.contentType,title=d.title or d.filename or row[1],version=item and item.version or 0}); row=stmt:step(row) end
-    stmt:close(); table.sort(out,function(a, b) if a.is_pdf~=b.is_pdf then return a.is_pdf end return (a.text or "")<(b.text or "") end); return out
+    while row do
+        local item=safe_decode(row[2]); local d=item and item.data or {}
+        -- kind: what the reader can open ("pdf", "epub", "html"); nil for a
+        -- link to a web page, which is listed but cannot be opened
+        local kind=API.attachmentKind(d)
+        table.insert(out,{key=row[1],text=d.filename or d.title or row[1],type="attachment",kind=kind,is_pdf=kind=="pdf",contentType=d.contentType,linkMode=d.linkMode,title=d.title or d.filename or row[1],version=item and item.version or 0})
+        row=stmt:step(row)
+    end
+    stmt:close()
+    -- what can be opened first (PDF, then EPUB, then web snapshots), links last
+    table.sort(out,function(a, b)
+        local ka,kb=KIND_ORDER[a.kind] or 9,KIND_ORDER[b.kind] or 9
+        if ka~=kb then return ka<kb end
+        return (a.text or "")<(b.text or "")
+    end)
+    return out
+end
+--- The attachment to open when an entry is tapped: the only one of the best
+-- kind it has (PDF before EPUB before web snapshot).
+-- @return the attachment, or nil and the list of those that can be opened
+--         (empty: links only, or nothing; several: the user has to choose)
+function API.pickAttachment(key)
+    local usable={}
+    for __,a in ipairs(API.getItemAttachments(key) or {}) do
+        if a.kind then usable[#usable+1]=a end
+    end
+    if #usable==0 then return nil,usable end
+    local best=0
+    for __,a in ipairs(usable) do if a.kind==usable[1].kind then best=best+1 end end
+    if best==1 then return usable[1],usable end
+    return nil,usable
 end
 function API.getItemWithAttachments(key)
     local item=API.getItem(key); if not item then return nil end
     local list=API.getItemAttachments(key); local attachments={}
-    for __,x in ipairs(list) do local ai=API.getItem(x.key); if ai and ai.data then local d=ai.data; local sv,ls=API.getAttachmentVersion(x.key); d.syncedVersion=sv; d.lastSync=ls; table.insert(attachments,d) end end
+    for __,x in ipairs(list) do local ai=API.getItem(x.key); if ai and ai.data then local d=ai.data; local sv,ls=API.getAttachmentVersion(x.key); d.syncedVersion=sv; d.lastSync=ls; d.kind=x.kind; table.insert(attachments,d) end end
     item.attachments=attachments; return item
 end
 
@@ -1244,6 +1300,39 @@ function API.resetSyncState()
     API.closeDB(); local bak=BaseUtil.joinPath(API.zotero_dir,"zotero.db.old"); os.remove(bak); if not os.rename(API.db_path,bak) then os.remove(API.db_path) end; API.openDB()
 end
 
+--- Unpack a zip file into a folder. @return true or false
+local function extract_zip(zip, dir)
+    -- the reader's own archive library (works on every device)
+    local ok_lib,Archiver=pcall(require,"ffi/archiver")
+    if ok_lib and type(Archiver)=="table" and Archiver.Reader then
+        local done=false
+        local ok=pcall(function()
+            local arc=Archiver.Reader:new()
+            if arc:open(zip) then
+                local all=true
+                for entry in arc:iterate() do
+                    local path=entry.path
+                    if type(path)=="string" and path~="" and not path:find("..",1,true) and path:sub(1,1)~="/" then
+                        if entry.mode=="file" then
+                            local dest=BaseUtil.joinPath(dir,path)
+                            local parent=dest:match("^(.*)/[^/]+$"); if parent then mkdir_p(parent) end
+                            if not arc:extractToPath(path,dest) then all=false; break end
+                        end
+                    end
+                end
+                arc:close()
+                done=all
+            end
+        end)
+        if ok and done then return true end
+    end
+    if BaseUtil.extractArchive and pcall(BaseUtil.extractArchive,zip,dir) then return true end
+    local cmd=string.format("unzip -o %q -d %q >/dev/null 2>&1",zip,dir)
+    local res=os.execute(cmd)
+    return res==0 or res==true
+end
+API._extractZip=extract_zip
+
 function API.downloadWebDAV(key, targetDir, targetPath)
     local base=API.getWebDAVUrl(); if base=="" then return nil,"WebDAV url not set" end
     mkdir_p(targetDir); local zip=BaseUtil.joinPath(targetDir,key..".zip"); local f=io.open(zip,"wb"); if not f then return nil,"Could not create WebDAV zip" end
@@ -1251,11 +1340,7 @@ function API.downloadWebDAV(key, targetDir, targetPath)
     local ok,r,c=pcall(https.request,{method="GET",url=base:gsub("/$","").."/"..key..".zip",headers=API.getWebDAVHeaders(),sink=ltn12.sink.file(f)})
     if socketutil then socketutil:reset_timeout() end
     local e=(not ok) and ("Error: "..tostring(r)) or API.verifyResponse(r,c); if e then os.remove(zip); return nil,e end
-    ok=false
-    if BaseUtil.extractArchive then ok=pcall(BaseUtil.extractArchive,zip,targetDir) end
-    if not ok then
-        local cmd=string.format("unzip -o %q -d %q >/dev/null 2>&1",zip,targetDir); ok=(os.execute(cmd)==0 or os.execute(cmd)==true)
-    end
+    ok=extract_zip(zip,targetDir)
     os.remove(zip); if not ok then return nil,"Unzipping failed" end
     if file_exists(targetPath) then return targetPath end
     return API.findFileByBasename(targetDir,API.basenameOfPath(targetPath)) or targetPath
@@ -1270,8 +1355,8 @@ end
 function API.downloadAndGetPath(key, download_callback)
     local item=API.getItem(key); if not item then return nil,"Error: the requested file can not be found in the database" end
     if not item.data or item.data.itemType~="attachment" then return nil,"Error: this item is not an attachment" end
-    if not API.isSupportedAttachmentLinkMode(item.data.linkMode) then return nil,"Error: this item has unsupported link mode" end
-    if not table_contains(SUPPORTED_MEDIA_TYPES,item.data.contentType) then return nil,"Error: this item has an unsupported content type ("..tostring(item.data.contentType)..")" end
+    local kind=API.attachmentKind(item.data)
+    if not kind then return nil,API.whyNotOpenable(item.data) end
     local local_path=API.resolveAttachmentPath(item)
     if local_path and file_exists(local_path) then
         API.getAttachmentInfo(item,local_path); API.markAttachmentPresent(key)
@@ -1291,15 +1376,37 @@ function API.downloadAndGetPath(key, download_callback)
         if socketutil then socketutil:reset_timeout() end
         local err=(not ok) and ("Error: "..tostring(r)) or API.verifyResponse(r,c)
         if err then os.remove(part); return nil,err end
-        os.remove(path)
-        if not os.rename(part,path) then os.remove(part); return nil,"Could not store attachment file" end
+        -- A web snapshot that consists of several files (older snapshots)
+        -- is stored by Zotero as a zip of its folder.
+        local zipped=false
+        if kind=="html" then
+            local pf=io.open(part,"rb")
+            if pf then zipped=pf:read(4)=="PK\3\4"; pf:close() end
+        end
+        if zipped then
+            local unpacked=extract_zip(part,dir)
+            os.remove(part)
+            if not unpacked then return nil,"Could not unpack the snapshot" end
+            if not file_exists(path) then path=API.findFileByBasename(dir,API.basenameOfPath(path)) or path end
+            if not file_exists(path) then return nil,"The snapshot's main file was not found in what Zotero stores for it" end
+        else
+            os.remove(path)
+            if not os.rename(part,path) then os.remove(part); return nil,"Could not store attachment file" end
+        end
     end
     API.getAttachmentInfo(item,path)
     API.setAttachmentVersionByKey(key,math.max(1,tonumber(item.version) or 1)); return path,nil
 end
 function API.batchDownload(progress_callback)
     progress_callback=progress_callback or function() end; local db=API.openDB(); local st=db:prepare([[SELECT i.key,d.value FROM itemAttachments a JOIN items i ON i.itemID=a.itemID JOIN itemData d ON d.itemID=i.itemID WHERE a.parentItemID IN (SELECT ci.itemID FROM collectionItems ci JOIN collections c ON c.collectionID=ci.collectionID WHERE c.synced=1)]])
-    local rows={}; local row=st:reset():step(); while row do table.insert(rows,{row[1],row[2]}); row=st:step(row) end; st:close(); local fails,details=0,{}
+    local rows={}; local row=st:reset():step()
+    while row do
+        -- only what is a file the reader can open: links to web pages are not downloads
+        local item=safe_decode(row[2])
+        if item and API.attachmentKind(item.data) then table.insert(rows,{row[1],row[2]}) end
+        row=st:step(row)
+    end
+    st:close(); local fails,details=0,{}
     for i,v in ipairs(rows) do
         local item=safe_decode(v[2]); local filename=item and item.data and item.data.filename or v[1]
         if progress_callback(string.format(_("Checking attachment %i/%i"),i,#rows))==false then break end
