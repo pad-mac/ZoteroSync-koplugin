@@ -13,10 +13,20 @@ local Font = require("ui/font")
 local Menu = require("ui/widget/menu")
 local Geom = require("ui/geometry")
 local _ = require("gettext")
+-- KOReader keeps the plugin's folder on the module path only while this file
+-- is being loaded, so every module of the plugin is required here, at the top.
 local ZoteroAPI = require("zoteroapi")
+local Annotations = require("annotations")
+local Util = require("zotero_util")
+local Sync = require("zotero_sync")
+local Doc = require("zotero_doc")
+local AnnotationSync = require("zotero_annsync")
+local Colors = require("zotero_colors")
+local Position = require("zotero_position")
 local itemInfoViewer = require("zoteroiteminfo")
 local AnnotationPanel = require("annotation_panel")
 local AnnotationSearch = require("annotation_search")
+local Notification = require("ui/widget/notification")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
 local ButtonDialog = require("ui/widget/buttondialog")
 local lfs = require("libs/libkoreader-lfs")
@@ -27,6 +37,34 @@ local Trapper = require("frontend/ui/trapper")
 local DEFAULT_LINES_PER_PAGE = 14
 
 local init_done = false
+
+-- KOReader keeps one module per name for all plugins. Another Zotero plugin
+-- (the original zotero.koplugin, or a second copy of this one under another
+-- folder name) has modules called "zoteroapi" and "annotations" too, and
+-- whichever plugin is loaded first wins. This plugin cannot run on theirs.
+local FORK = "0.6"
+local foreign_modules = {}
+for name, mod in pairs({
+    zoteroapi = ZoteroAPI, annotations = Annotations, zotero_util = Util, zotero_sync = Sync,
+    zotero_doc = Doc, zotero_annsync = AnnotationSync, zotero_colors = Colors, zotero_position = Position, zoteroiteminfo = itemInfoViewer,
+    annotation_panel = AnnotationPanel, annotation_search = AnnotationSearch,
+}) do
+    if type(mod) ~= "table" or mod.fork ~= FORK then
+        foreign_modules[#foreign_modules + 1] = name
+    end
+end
+table.sort(foreign_modules)
+
+local function init_error(e)
+    logger.err("Zotero: could not initialize:", tostring(e), debug.traceback())
+end
+
+-- os.time() of the last sign of life of a sync that is running
+local sync_alive_at
+
+local function syncBusy()
+    return sync_alive_at ~= nil and os.time() - sync_alive_at < 300
+end
 
 local function readableStatus(value)
     if value == nil then return nil end
@@ -47,6 +85,31 @@ local function readableStatus(value)
     return "{" .. table.concat(parts, ", ") .. "}"
 end
 
+--- Progress reporting for a sync that runs inside Trapper:wrap.
+-- Every message shown costs a tenth of a second and a screen refresh, so the
+-- same kind of message is shown at most once per second. The function
+-- returns false from the moment the user chooses to stop the sync.
+local function makeProgress(not_stoppable)
+    local last_kind, last_time
+    local stopped = false
+    local hint = not_stoppable and "" or ("\n\n" .. _("(Tap this message to stop.)"))
+    local function progress(msg)
+        sync_alive_at = os.time()
+        if stopped then return false end
+        local text = readableStatus(msg) or ""
+        local kind = text:gsub("%d+", "#")
+        local now = os.time()
+        if kind == last_kind and now == last_time then return true end
+        last_kind, last_time = kind, now
+        if Trapper:info(text .. hint) == false then
+            stopped = true
+            return false
+        end
+        return true
+    end
+    return progress, function() return stopped end
+end
+
 local table_empty = function(table)
     -- see https://stackoverflow.com/a/1252776
     local next = next
@@ -63,28 +126,28 @@ local function truncatePath(p, max_len)
     end
     return "…" .. p:sub(-max_len + 2)
 end
--- Optionally disable writing highlights into the PDF file itself.
--- Default: leave KOReader's write-into-PDF setting alone (auto_disable = false).
--- When write-into-PDF is allowed (auto_disable false), enable it on Zotero PDFs.
-local function configureZoteroDocumentSettings(file_path)
-    if file_path and file_path:match("%.pdf$") then
-        local auto_disable = ZoteroAPI.getSettings():readSetting("auto_disable_pdf_writing", false)
-        local doc_settings = DocSettings:open(file_path)
-        if auto_disable then
-            logger.info("Zotero: Disabling PDF annotation writing for: " .. file_path)
-            doc_settings:saveSetting("highlight_write_into_pdf", false)
-        else
-            logger.info("Zotero: Enabling PDF annotation writing for: " .. file_path)
-            doc_settings:saveSetting("highlight_write_into_pdf", true)
-        end
-        doc_settings:flush()
+-- Writing highlights into the PDF file itself.
+--
+-- For a PDF that belongs to Zotero this is off unless the user turns it on:
+-- annotations travel as Zotero annotations, and a second copy embedded in the
+-- file would change the attachment on this device only (it no longer matches
+-- the file Zotero has) and show up twice wherever both are displayed.
+local function pdfWritingDisabled()
+    local settings = ZoteroAPI.getSettings()
+    if settings:has("auto_disable_pdf_writing") then
+        return settings:isTrue("auto_disable_pdf_writing") -- an explicit choice made in the menu
     end
+    return true
 end
-local function enableWriteIntoPdf(file_path)
-    if file_path and file_path:match("%.pdf$") then
+local function configureZoteroDocumentSettings(file_path)
+    if file_path and file_path:lower():match("%.pdf$") then
+        local want = not pdfWritingDisabled()
         local doc_settings = DocSettings:open(file_path)
-        doc_settings:saveSetting("highlight_write_into_pdf", true)
-        doc_settings:flush()
+        if doc_settings:readSetting("highlight_write_into_pdf") ~= want then
+            logger.info("Zotero: write highlights into PDF", want and "on" or "off", "for", file_path)
+            doc_settings:saveSetting("highlight_write_into_pdf", want)
+            doc_settings:flush()
+        end
     end
 end
 local ZoteroBrowser = Menu:extend({
@@ -218,7 +281,7 @@ function ZoteroBrowser:onMenuSelect(item)
             return
         end
         local pdf_attachment = nil
-        for _, attachment in ipairs(attachments) do
+        for __, attachment in ipairs(attachments) do
             if attachment.is_pdf then
                 pdf_attachment = attachment
                 break
@@ -351,98 +414,230 @@ function Plugin:onDispatcherRegisterActions()
         general = true,
     })
 end
-function Plugin:reloadReaderAnnotations(readerui)
-    if readerui and readerui.reloadDocument then
-        UIManager:scheduleIn(0.1, function()
-            readerui:reloadDocument()
-        end)
+--- Run fn without treating the annotation changes it makes as the user's.
+function Plugin:guarded(fn)
+    local was = self._applying
+    self._applying = true
+    local ok, err = pcall(fn)
+    self._applying = was
+    if not ok then error(err, 0) end
+end
+
+--- Repaint and tell the user after annotations of the open document changed.
+function Plugin:afterAnnotationChanges(stats, repaired, quiet)
+    local ui = self.ui
+    local changed = (repaired or 0) > 0 or (stats ~= nil and Sync.changedLocally(stats))
+    if changed and ui then
+        UIManager:setDirty(ui.dialog or "all", "ui")
+    end
+    if quiet or not changed then return end
+    local parts = {}
+    if stats then
+        local done = Sync.summary(stats)
+        for i = 1, #done do parts[#parts + 1] = done[i] end
+        if stats.unplaced > 0 then
+            parts[#parts + 1] = string.format(_("%d could not be placed"), stats.unplaced)
+        end
+    end
+    if (repaired or 0) > 0 then
+        parts[#parts + 1] = _("annotation list repaired")
+    end
+    if #parts > 0 then
+        -- (with a source, or the reader may keep it to itself)
+        Notification:notify(_("Zotero: ") .. table.concat(parts, ", "), Notification.SOURCE_ALWAYS_SHOW)
     end
 end
-function Plugin:syncOpenDocumentAnnotations(readerui, opts)
-    opts = opts or {}
-    if not init_done or not readerui or not readerui.document or not readerui.document.file then
-        return
-    end
-    local file_path = readerui.document.file
-    local key = ZoteroAPI.findAttachmentKeyByFilePath(file_path)
-    if not key then return end
-    if not (Annotations.isPdfPath(file_path) or Annotations.isEpubPath(file_path)) then
-        if opts.notify then
-            UIManager:show(InfoMessage:new({
-                text = _("Annotation sync currently supports PDF and EPUB only."),
-                timeout = 4,
-                icon = "notice-warning",
-            }))
-        end
-        return
-    end
 
-    -- Flush live annotations to sidecar before an explicitly requested upload.
-    if readerui.annotation and readerui.annotation.annotations and readerui.doc_settings then
-        readerui.doc_settings:saveSetting("annotations", readerui.annotation.annotations)
-        readerui.doc_settings:flush()
+--- Bring the open document up to date with the local copy of the library
+-- (new and changed Zotero annotations, deletions). No network, no uploads.
+function Plugin:importOpenDocument()
+    local ui = self.ui
+    if not init_done or not ui or not ui.document then return end
+    local stats, repaired = AnnotationSync.openDocument(ui, function(fn) self:guarded(fn) end)
+    if stats or (repaired or 0) > 0 then
+        self:afterAnnotationChanges(stats, repaired)
     end
-    NetworkMgr:runWhenOnline(function()
-        local ok, create_fails, delete_fails, update_fails, sync_err = pcall(
-            ZoteroAPI.syncAnnotationsForAttachment, key, file_path
-        )
+    -- opened from the annotation search: the reader goes to that annotation,
+    -- not to where Zotero was last
+    self:applyZoteroPosition(false, AnnotationSearch.isPending(ui))
+end
+
+--- Go to where Zotero last read the open document, if that is news.
+-- @return the page gone to, or nil
+function Plugin:applyZoteroPosition(quiet, stay)
+    local ui = self.ui
+    if not init_done or not ui or not ui.document then return nil end
+    local ok, page = pcall(function()
+        local key, file_path = AnnotationSync.identify(ui)
+        if not key or not AnnotationSync.kindOf(file_path) then return nil end
+        return Position.apply(ui, key, stay)
+    end)
+    if not ok then
+        logger.warn("Zotero: applying the reading position failed:", tostring(page))
+        return nil
+    end
+    if page and not quiet then
+        Notification:notify(string.format(_("Zotero: continued on page %s (Back returns)"), tostring(page)),
+            Notification.SOURCE_ALWAYS_SHOW)
+    end
+    return page
+end
+
+function Plugin:onReaderReady()
+    if not init_done or not self.ui or not self.ui.document then return end
+    local ui = self.ui
+    -- a moment later, so that the document shows first
+    UIManager:scheduleIn(0.3, function()
+        if not ui.document then return end -- closed again already
+        local ok, err = pcall(function() self:importOpenDocument() end)
         if not ok then
-            logger.err("Zotero: syncAnnotationsForAttachment failed: ", create_fails)
-            if opts.notify then
-                UIManager:show(InfoMessage:new({text=_("Annotation sync failed: ") .. tostring(create_fails), timeout=5, icon="notice-warning"}))
-            end
-            return
+            logger.err("Zotero: annotation import on open failed:", tostring(err))
         end
-        local total=(create_fails or 0)+(delete_fails or 0)+(update_fails or 0)
-        if opts.notify then
-            if total>0 or sync_err then
-                UIManager:show(InfoMessage:new({
-                    text=string.format(_("Annotation sync finished with %d failed operation(s)."), total) .. (sync_err and ("\n"..tostring(sync_err)) or ""),
-                    timeout=6,
-                    icon="notice-warning",
-                }))
-            else
-                UIManager:show(InfoMessage:new({text=_("Annotations synced to Zotero."), timeout=2, icon="notice-info"}))
-            end
-        end
+        -- opened from the annotation search: go to the annotation chosen there
+        AnnotationSearch.jumpIfPending(ui)
     end)
 end
 
-function Plugin:onReaderReady(readerui)
-    if not init_done or not readerui or not readerui.document or not readerui.document.file then
+--- The reader tells us when an annotation is added, changed or removed.
+-- A removed annotation that exists in Zotero is noted in the document's
+-- delete log: that note - and nothing else - is what later allows the
+-- annotation to be deleted in Zotero.
+function Plugin:onAnnotationsModified(items)
+    if not init_done or self._applying or type(items) ~= "table" then return end
+    local index = items.index_modified
+    if type(index) ~= "number" or index >= 0 then return end
+    local item = items[1]
+    if type(item) ~= "table" or not Util.isValidKey(item.zoteroKey) then return end
+    local ds = self.ui and self.ui.doc_settings
+    if not ds then return end
+    local log = ds:readSetting("zotero_deleted")
+    if type(log) ~= "table" then log = {} end
+    log[item.zoteroKey] = tonumber(item.zoteroVersion) or 0
+    ds:saveSetting("zotero_deleted", log)
+    logger.info("Zotero: annotation", item.zoteroKey, "deleted in the reader; will be deleted in Zotero at the next sync")
+end
+
+function Plugin:onCloseDocument()
+    -- No upload here: sending to Zotero happens only when a sync is asked for.
+    -- But while the book is still open, work out the Zotero positions of new
+    -- EPUB highlights, so that a later sync can send them with the book closed.
+    if not init_done or not self.ui or not self.ui.document then return end
+    local ui = self.ui
+    local ok, err = pcall(function()
+        local key, file_path
+        if ui.rolling then key, file_path = AnnotationSync.identify(ui) end
+        if key and AnnotationSync.kindOf(file_path) then
+            local n = Doc.cacheEpubPositions(ui)
+            -- and the Zotero form of the place the book is closed at
+            if Position.cacheOnClose(ui, key) then n = n + 1 end
+            if n > 0 and ui.dialog ~= ui then
+                -- the reader saved the document's settings before telling us
+                ui:saveSettings()
+            end
+        end
+    end)
+    if not ok then logger.warn("Zotero: preparing EPUB positions failed:", tostring(err)) end
+end
+
+--- Run a sync: one at a time, online, with progress messages the user can
+-- stop, and with a message instead of silence if it fails unexpectedly.
+-- @param fn function(progress, stopped)
+function Plugin:runSync(fn)
+    if syncBusy() then
+        UIManager:show(InfoMessage:new({
+            text = _("A Zotero sync is already running."),
+            timeout = 3,
+        }))
         return
     end
-    local file_path = readerui.document.file
-    local key = ZoteroAPI.findAttachmentKeyByFilePath(file_path)
-    if not key then
-        return
-    end
-    local item = ZoteroAPI.getItem(key)
-    if not item then
-        return
-    end
-    local doc_settings = DocSettings:open(file_path)
-    local sidecar_lib_version = doc_settings:readSetting("zoteroLibVersion", 0)
-    doc_settings:close()
-    logger.info("Zotero: Matched open document to attachment " .. key)
-    if sidecar_lib_version < ZoteroAPI.getUserLibraryVersion() then
-        local ok, err = pcall(function()
-            local result = ZoteroAPI.attachItemAnnotations(item, nil, file_path)
-            if result and result:match("^Error") then
-                logger.warn("Zotero: " .. tostring(result))
-            else
-                self:reloadReaderAnnotations(readerui)
+    NetworkMgr:runWhenOnline(function()
+        Trapper:wrap(function()
+            sync_alive_at = os.time()
+            Trapper:setPausedText(_("Stop the Zotero sync?"), _("Stop"), _("Continue"))
+            local progress, stopped = makeProgress()
+            local ok, err = xpcall(function() fn(progress, stopped) end, debug.traceback)
+            sync_alive_at = nil
+            Trapper:setPausedText(nil, nil, nil)
+            if not ok then
+                logger.err("Zotero: sync failed:", tostring(err))
+                Trapper:info(_("The Zotero sync failed unexpectedly. See crash.log for details.")
+                    .. "\n" .. tostring(err):match("^[^\n]*"))
             end
         end)
-        if not ok then
-            logger.err("Zotero: Failed to attach annotations on reader open: ", err)
-        end
-    end
-    -- SAFETY: do not upload automatically on open. While PDF coordinate
-    -- conversion is being validated, Zotero writes are manual only.
+    end)
 end
-function Plugin:onCloseDocument()
-    -- Intentionally no automatic Zotero write; use “Sync document annotations”.
+
+--- "Sync document annotations": download what changed in Zotero, merge with
+-- the open document, upload what changed here.
+function Plugin:syncOpenDocumentAnnotations()
+    if not self:checkInitialized() then return end
+    local ui = self.ui
+    if not ui or not ui.document then return end
+    local key, file_path = AnnotationSync.identify(ui)
+    if not key then
+        UIManager:show(InfoMessage:new({
+            text = _("This document is not known as a Zotero attachment.\nSynchronize the library first, or open the document from the Zotero browser."),
+            timeout = 6,
+            icon = "notice-warning",
+        }))
+        return
+    end
+    if not AnnotationSync.kindOf(file_path) then
+        UIManager:show(InfoMessage:new({
+            text = _("Annotation sync supports PDF and EPUB documents."),
+            timeout = 4,
+            icon = "notice-warning",
+        }))
+        return
+    end
+    self:runSync(function(progress, stopped)
+        progress(_("Synchronizing annotations with Zotero…"))
+        local lines = {}
+        local online_error = ZoteroAPI.pull(progress)
+        if stopped() then
+            Trapper:info(ZoteroAPI.CANCELLED)
+            return
+        end
+        if not ui.document then return end -- closed meanwhile
+        if online_error then
+            lines[#lines + 1] = _("Zotero could not be reached; nothing was uploaded.") .. "\n" .. readableStatus(online_error)
+        end
+        local can_push = online_error == nil and ZoteroAPI.canWrite()
+        local ok, stats, repaired = pcall(AnnotationSync.openDocument, ui, function(fn) self:guarded(fn) end, { push = can_push })
+        if not ok or not stats then
+            logger.err("Zotero: document annotation sync failed:", tostring(stats))
+            Trapper:info(_("Annotation sync failed. See crash.log for details."))
+            return
+        end
+        self:afterAnnotationChanges(stats, repaired, true)
+        -- reading position: Zotero's, if it is news; otherwise ours goes up
+        local went = self:applyZoteroPosition(true)
+        local sent = false
+        if can_push and ui.document then
+            local pok, res = pcall(Position.pushOpen, ui, key)
+            if not pok then logger.warn("Zotero: sending the reading position failed:", tostring(res)) end
+            sent = pok and res == "sent"
+        end
+        local done, problems = Sync.summary(stats)
+        if #done == 0 and #problems == 0 and not online_error then
+            lines[#lines + 1] = _("Annotations are up to date.")
+        end
+        if went then
+            lines[#lines + 1] = string.format(_("Continued where Zotero was last read: page %s (Back returns)."), tostring(went))
+        elseif sent then
+            lines[#lines + 1] = _("Reading position sent to Zotero.")
+        end
+        for __, l in ipairs(done) do lines[#lines + 1] = l end
+        for __, l in ipairs(problems) do lines[#lines + 1] = l end
+        if online_error == nil and not ZoteroAPI.canWrite() and stats.pending > 0 then
+            lines[#lines + 1] = _("The API key is read-only: changes made here were not uploaded.")
+        end
+        if stats.unsupported > 0 then
+            lines[#lines + 1] = string.format(_("%d Zotero annotations of other kinds (notes, images, drawings) are not shown in KOReader."), stats.unsupported)
+        end
+        for i = 1, math.min(3, #stats.messages) do lines[#lines + 1] = "· " .. stats.messages[i] end
+        Trapper:info(table.concat(lines, "\n"))
+    end)
 end
 
 function Plugin:onCloseWidget()
@@ -454,19 +649,29 @@ function Plugin:init()
     -- But at least the ZoteroAPI only needs to be initialised once
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
-    if not init_done then
-        xpcall(self.initAPI, self.initError, self)
-        init_done = true
+    if #foreign_modules > 0 then
+        logger.err("Zotero: modules of another plugin were loaded in place of this plugin's own:",
+            table.concat(foreign_modules, ", "))
+        self.initialized = false
+        return
     end
-    xpcall(self.initBrowser, self.initError, self)
+    if not init_done then
+        init_done = xpcall(self.initAPI, init_error, self)
+    end
+    xpcall(self.initBrowser, init_error, self)
     self.initialized = init_done
-    logger.dbg("Zotero: successfully initialized!")
+    logger.dbg("Zotero: initialized:", init_done)
 end
 
-function Plugin:initError(e)
-    logger.err("Zotero: Could not initialize Zotero: " .. e)
-end
 function Plugin:checkInitialized()
+    if #foreign_modules > 0 then
+        UIManager:show(InfoMessage:new({
+            text = _("Zotero Atelier cannot run: another Zotero plugin is installed that uses the same file names (zotero.koplugin, or a second copy of Zotero Atelier).\n\nRemove the other plugin's folder from koreader/plugins and restart KOReader.")
+                .. "\n\n(" .. table.concat(foreign_modules, ", ") .. ")",
+            icon = "notice-warning",
+        }))
+        return false
+    end
     if not self.initialized or self.browser == nil then
         UIManager:show(InfoMessage:new({
             text = _(
@@ -477,14 +682,20 @@ function Plugin:checkInitialized()
             timeout = 6,
             icon = "notice-warning",
         }))
+        return false
     end
-    return self.initialized
+    return true
 end
 
 function Plugin:initAPI()
     self.zotero_dir_path = DataStorage:getDataDir() .. "/zotero"
     lfs.mkdir(self.zotero_dir_path)
     ZoteroAPI.init(self.zotero_dir_path)
+    -- the reader's highlight colours: Zotero's set, readable on this screen
+    Colors.init(ZoteroAPI.getSettings())
+    Colors.apply()
+    -- highlights without a colour of their own are sent with the reader's default colour
+    Annotations.setDefaultColor(G_reader_settings:readSetting("highlight_color") or "yellow")
 end
 function Plugin:initBrowser()
     self.small_font_face = Font:getFace("smallffont")
@@ -542,7 +753,7 @@ function Plugin:getZoteroSubMenu()
                     return self.ui ~= nil and self.ui.document ~= nil
                 end,
                 callback = function()
-                    self:syncOpenDocumentAnnotations(self.ui, { notify = true })
+                    self:syncOpenDocumentAnnotations()
                 end,
             },
             {
@@ -626,20 +837,36 @@ function Plugin:getZoteroSubMenu()
                     },
                     {
                         text = _("Write highlights into PDF files"),
+                        help_text = _("Off by default for Zotero documents: highlights are synchronized as Zotero annotations. Writing them into the PDF as well changes the file on this device only."),
                         checked_func = function()
-                            return not ZoteroAPI.getSettings():readSetting("auto_disable_pdf_writing", false)
+                            return not pdfWritingDisabled()
                         end,
                         callback = function()
-                            local cur = ZoteroAPI.getSettings():readSetting("auto_disable_pdf_writing", false)
-                            ZoteroAPI.getSettings():saveSetting("auto_disable_pdf_writing", not cur)
+                            local disable = not pdfWritingDisabled()
+                            ZoteroAPI.getSettings():saveSetting("auto_disable_pdf_writing", disable)
                             ZoteroAPI.saveSettingsToFile()
-                            if self.ui and self.ui.document and self.ui.document.file then
-                                if not cur then
-                                    configureZoteroDocumentSettings(self.ui.document.file)
-                                else
-                                    enableWriteIntoPdf(self.ui.document.file)
-                                end
+                            -- apply to the PDF that is open right now, if it is a Zotero attachment
+                            local ui = self.ui
+                            if ui and ui.document and ui.document.is_pdf and ui.highlight and AnnotationSync.identify(ui) then
+                                ui.highlight.highlight_write_into_pdf = not disable
                             end
+                        end,
+                    },
+                    {
+                        text = _("Sync the reading position"),
+                        help_text = _("Zotero remembers where each document was last read. With this on, a document opens here where Zotero was last (your previous place is one tap on Back away), and a sync sends the place reached here to Zotero."),
+                        checked_func = function()
+                            return Position.enabled()
+                        end,
+                        callback = function()
+                            ZoteroAPI.getSettings():saveSetting("sync_reading_position", not Position.enabled())
+                            ZoteroAPI.saveSettingsToFile()
+                        end,
+                    },
+                    {
+                        text = _("Highlight colours"),
+                        sub_item_table_func = function()
+                            return self:getColorMenu()
                         end,
                     },
                     {
@@ -784,9 +1011,7 @@ function Plugin:getZoteroSubMenu()
                 callback = function()
                     local version = ZoteroAPI.version
                     local stats = ZoteroAPI.getStats()
-                    local write_pdf = (not ZoteroAPI.getSettings():readSetting("auto_disable_pdf_writing", false))
-                        and "Enabled"
-                        or "Disabled"
+                    local write_pdf = (not pdfWritingDisabled()) and "Enabled" or "Disabled"
                     UIManager:show(InfoMessage:new({
                         text = _(
                             "Plugin version: \n"
@@ -819,8 +1044,97 @@ function Plugin:getZoteroSubMenu()
     }
 end
 
+--- Colours changed: draw the open document's highlights again.
+function Plugin:colorsChanged()
+    Colors.apply()
+    ZoteroAPI.saveSettingsToFile()
+    local ui = self.ui
+    if ui and ui.document and ui.view then
+        pcall(function()
+            ui.view:resetHighlightBoxesCache()
+            if ui.highlight and ui.highlight.setSelectionColor then ui.highlight:setSelectionColor() end
+        end)
+        UIManager:setDirty(ui.dialog or "all", "ui")
+    end
+end
+
+function Plugin:getColorMenu()
+    local items = {
+        {
+            text = _("Colour menu like Zotero's (with magenta)"),
+            help_text = _("The colour menu of the reader shows Zotero's eight colours (with magenta, without olive and cyan). Existing olive and cyan highlights stay as they are."),
+            checked_func = function() return Colors.paletteEnabled() end,
+            callback = function()
+                Colors.setPaletteEnabled(not Colors.paletteEnabled())
+                self:colorsChanged()
+            end,
+        },
+        {
+            text = _("Use the darkness values below"),
+            help_text = _("On: every highlight is drawn as a grey, as dark as the value set for its colour below. This is what a screen without colour needs.\n\nOff: highlights are drawn in their real colours. On a grey screen that leaves only the brightness the colour happens to have: yellow is almost invisible, blue almost black.\n\nGray is not in the list: it follows the reader's own \"Gray highlight opacity\"."),
+            checked_func = function() return Colors.tintsEnabled() end,
+            callback = function()
+                Colors.setTintsEnabled(not Colors.tintsEnabled())
+                self:colorsChanged()
+            end,
+            separator = true,
+        },
+    }
+    for __, name in ipairs(Colors.TINTED) do
+        items[#items + 1] = {
+            text_func = function()
+                return string.format("%s: %d %%", Colors.label(name), Colors.level(name))
+            end,
+            enabled_func = function() return Colors.tintsEnabled() end,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                UIManager:show(SpinWidget:new({
+                    title_text = Colors.label(name),
+                    info_text = _("How dark this colour's highlights are drawn, in percent. Higher is darker."),
+                    value = Colors.level(name),
+                    value_min = 0,
+                    value_max = 90,
+                    value_step = 1,
+                    value_hold_step = 5,
+                    callback = function(spin)
+                        Colors.setLevel(name, spin.value)
+                        self:colorsChanged()
+                        if touchmenu_instance then touchmenu_instance:updateItems() end
+                    end,
+                }))
+            end,
+        }
+    end
+    items[#items].separator = true
+    items[#items + 1] = {
+        text = _("Reset the darkness values"),
+        enabled_func = function() return Colors.tintsEnabled() end,
+        keep_menu_open = true,
+        callback = function(touchmenu_instance)
+            Colors.resetLevels()
+            self:colorsChanged()
+            if touchmenu_instance then touchmenu_instance:updateItems() end
+        end,
+    }
+    return items
+end
+
 function Plugin:addToMainMenu(menu_items)
-    local sub_menu = self:getZoteroSubMenu()
+    local sub_menu
+    if #foreign_modules > 0 or not self.initialized or self.browser == nil then
+        -- Nothing of the plugin can be relied on: the menu only explains why.
+        sub_menu = {
+            {
+                text = _("Why is Zotero Atelier not running?"),
+                keep_menu_open = true,
+                callback = function()
+                    self:checkInitialized()
+                end,
+            },
+        }
+    else
+        sub_menu = self:getZoteroSubMenu()
+    end
     menu_items.zoteroatelier = {
         text = _("Zotero Atelier"),
         sorting_hint = "search",
@@ -1144,7 +1458,7 @@ function Plugin:showSearchRoots()
         item_table = items,
         is_borderless = true,
         is_popout = true,
-        onMenuHold = function(_, item)
+        onMenuHold = function(__, item)
             ZoteroAPI.removeSearchRoot(item.index)
             ZoteroAPI.saveSettingsToFile()
             UIManager:close(menu)
@@ -1242,19 +1556,48 @@ function Plugin:onZoteroSyncAction()
     if not self:checkInitialized() then
         return
     end
-    NetworkMgr:runWhenOnline(function()
-        Trapper:wrap(function()
-            Trapper:info("Synchronizing Zotero library.")
-            local e = ZoteroAPI.syncAllItems(function(msg)
-                Trapper:info(readableStatus(msg))
-            end)
+    self:runSync(function(progress)
+        progress("Synchronizing Zotero library.")
+        local open_ui = (self.ui and self.ui.document) and self.ui or nil
+        local e, summary = ZoteroAPI.syncAllItems(progress, {
+            -- runs after the library has been downloaded
+            annotations = function(report)
+                local can_push = ZoteroAPI.canWrite()
+                if open_ui and not open_ui.document then open_ui = nil end -- closed meanwhile
+                local positions_sent, went = 0, nil
+                local done, problems, stats = AnnotationSync.all(report, open_ui,
+                    function(fn) self:guarded(fn) end, can_push,
+                    function(key, path, is_open)
+                        -- reading positions travel with the same sync
+                        local result, page = Position.sync(open_ui, key, path, is_open, can_push)
+                        went = page or went
+                        if result == "sent" then positions_sent = positions_sent + 1 end
+                    end)
+                if positions_sent > 0 then
+                    done[#done + 1] = string.format(positions_sent == 1 and "Reading position of %d document sent to Zotero"
+                        or "Reading positions of %d documents sent to Zotero", positions_sent)
+                end
+                if went then
+                    done[#done + 1] = string.format("Continued where Zotero was last read: page %s (Back returns)", tostring(went))
+                end
+                if open_ui and Sync.changedLocally(stats) then
+                    UIManager:setDirty(open_ui.dialog or "all", "ui")
+                end
+                if not can_push and stats.pending > 0 then
+                    problems[#problems + 1] = "The API key is read-only: changes made here were not uploaded."
+                end
+                return done, problems
+            end,
+        })
 
-            if e == nil then
-                Trapper:info("Success")
-            else
-                Trapper:info(readableStatus(e))
-            end
-        end)
+        local lines = {}
+        if e == nil then
+            lines[#lines + 1] = "Success"
+        else
+            lines[#lines + 1] = readableStatus(e)
+        end
+        for i = 1, #(summary or {}) do lines[#lines + 1] = summary[i] end
+        Trapper:info(table.concat(lines, "\n"))
     end)
 end
 function Plugin:onZoteroReanalyzeAction()
@@ -1262,10 +1605,12 @@ function Plugin:onZoteroReanalyzeAction()
         return
     end
     Trapper:wrap(function()
-        Trapper:info("Synchronizing Zotero library.")
+        Trapper:info("Rebuilding the local index.")
+        local progress = makeProgress(true)
         local e = ZoteroAPI.checkItemData(function(msg)
-            Trapper:info(readableStatus(msg))
+            progress(msg)
         end)
+        sync_alive_at = nil
 
         if e == nil then
             Trapper:info("Success")

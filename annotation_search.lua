@@ -6,8 +6,9 @@ local NetworkMgr = require("ui/network/manager")
 local _ = require("gettext")
 local logger = require("logger")
 local ZoteroAPI = require("zoteroapi")
+local Event = require("ui/event")
 
-local AnnotationSearch = {}
+local AnnotationSearch = { fork = "0.6" }
 local function truncate(s, max_len)
     s = s or ""
     max_len = max_len or 90
@@ -74,7 +75,7 @@ function AnnotationSearch.showResults(plugin, query)
         return
     end
     local items = {}
-    for _, row in ipairs(results) do
+    for __, row in ipairs(results) do
         table.insert(items, {
             text = resultLabel(row),
             row = row,
@@ -87,7 +88,7 @@ function AnnotationSearch.showResults(plugin, query)
         is_borderless = true,
         is_popout = true,
         multilines_show_more_text = true,
-        onMenuChoice = function(_, item)
+        onMenuChoice = function(__, item)
             local row = item.row
             if row == nil or row.attachmentKey == nil then
                 return
@@ -115,27 +116,19 @@ function AnnotationSearch.openAnnotation(plugin, row)
         if path == nil then
             return
         end
-        if plugin and plugin.ui and plugin.ui.switchDocument then
+        -- Where to go is remembered and used once the document is open and
+        -- its Zotero annotations are in place (see jumpIfPending).
+        AnnotationSearch.pending_jump = { key = row.key, path = path, page = tonumber(row.page), at = os.time() }
+        local ReaderUI = require("apps/reader/readerui")
+        local current = ReaderUI.instance
+        if current and current.document and ZoteroAPI.pathsEqual(current.document.file, path) then
+            AnnotationSearch.jumpIfPending(current) -- this very document is open
+        elseif plugin and plugin.ui and plugin.ui.switchDocument then
             plugin.ui:switchDocument(path)
         elseif plugin and plugin.ui and plugin.ui.openFile then
             plugin.ui:openFile(path)
         else
-            local ReaderUI = require("apps/reader/readerui")
             ReaderUI:showReader(path)
-        end
-        -- Try goto page after a short delay
-        local page = tonumber(row.page)
-        if page then
-            UIManager:scheduleIn(0.5, function()
-                local ui = plugin and plugin.ui
-                if ui and ui.paging and ui.paging.onGotoPage then
-                    ui.paging:onGotoPage(page)
-                elseif ui and ui.document and ui.document.gotoPage then
-                    pcall(function()
-                        ui.document:gotoPage(page)
-                    end)
-                end
-            end)
         end
     end
     local local_path = ZoteroAPI.resolveAttachmentPath(item)
@@ -155,6 +148,51 @@ function AnnotationSearch.openAnnotation(plugin, row)
             }))
         end
     end)
+end
+
+--- Is the document that has just been opened the one an annotation was
+-- chosen in (so that the reader is about to go to that annotation)?
+function AnnotationSearch.isPending(ui)
+    local jump = AnnotationSearch.pending_jump
+    return jump ~= nil and os.time() - (jump.at or 0) <= 120
+        and ui ~= nil and ui.document ~= nil and ZoteroAPI.pathsEqual(ui.document.file, jump.path) or false
+end
+
+--- Go to the annotation chosen in the search results, if the document that
+-- has just been opened is the one it belongs to.
+-- @param ui the ReaderUI of the open document
+function AnnotationSearch.jumpIfPending(ui)
+    local jump = AnnotationSearch.pending_jump
+    if not jump then
+        return false
+    end
+    AnnotationSearch.pending_jump = nil
+    if os.time() - (jump.at or 0) > 120 then
+        return false
+    end
+    if not ui or not ui.document or not ZoteroAPI.pathsEqual(ui.document.file, jump.path) then
+        return false
+    end
+    local ok, err = pcall(function()
+        for __, ann in ipairs(ui.annotation and ui.annotation.annotations or {}) do
+            if ann.zoteroKey == jump.key then
+                if ui.link and ui.link.addCurrentLocationToStack then
+                    ui.link:addCurrentLocationToStack()
+                end
+                ui.bookmark:gotoBookmark(ann.page, ann.pos0)
+                return
+            end
+        end
+        -- Not in the document (a kind of annotation the reader does not
+        -- show, or one that could not be placed): at least its page, in a PDF.
+        if ui.paging and jump.page then
+            ui:handleEvent(Event:new("GotoPage", jump.page))
+        end
+    end)
+    if not ok then
+        logger.warn("Zotero: could not go to the annotation:", tostring(err))
+    end
+    return ok
 end
 
 return AnnotationSearch

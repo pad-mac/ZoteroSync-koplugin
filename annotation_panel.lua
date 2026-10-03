@@ -3,10 +3,11 @@ local Menu = require("ui/widget/menu")
 local InputDialog = require("ui/widget/inputdialog")
 local ConfirmBox = require("ui/widget/confirmbox")
 local InfoMessage = require("ui/widget/infomessage")
+local Event = require("ui/event")
 local _ = require("gettext")
 local logger = require("logger")
 
-local AnnotationPanel = {}
+local AnnotationPanel = { fork = "0.6" }
 
 local function sourceBadge(ann)
     if ann.zoteroKey then
@@ -118,45 +119,58 @@ function AnnotationPanel.show(ui, opts)
             UIManager:show(dialog)
             dialog:onShowKeyboard()
         end,
-        onMenuChoice = function(_, item)
+        onMenuChoice = function(__, item)
             local ann = item.ann
             if ann == nil then
                 return
             end
-            local page = ann.pageno or ann.page
-            if page and ui.paging and ui.paging.onGotoPage then
-                ui.paging:onGotoPage(tonumber(page))
-            elseif page and ui.link and ui.link.onGotoPage then
-                ui.link:onGotoPage(tonumber(page))
-            elseif page and ui.document and ui.document.gotoPage then
-                pcall(function()
-                    ui.document:gotoPage(tonumber(page))
-                    UIManager:setDirty(ui.view and ui.view.dialog or "all", "partial")
-                end)
-            elseif ann.pos0 and ann.pos0.xpointer and ui.link and ui.link.onGotoXPointer then
-                ui.link:onGotoXPointer(ann.pos0.xpointer)
-            end
             UIManager:close(menu)
+            -- Go there the way KOReader's own bookmark list does: works for
+            -- page numbers (PDF) and for positions inside a book (EPUB).
+            local ok = pcall(function()
+                if ui.link and ui.link.addCurrentLocationToStack then
+                    ui.link:addCurrentLocationToStack()
+                end
+                if ui.bookmark and ui.bookmark.gotoBookmark then
+                    ui.bookmark:gotoBookmark(ann.page, ann.pos0)
+                elseif ui.rolling then
+                    ui:handleEvent(Event:new("GotoXPointer", ann.page, ann.pos0 or ann.page))
+                else
+                    ui:handleEvent(Event:new("GotoPage", tonumber(ann.page)))
+                end
+            end)
+            if not ok then
+                logger.warn("Zotero: could not go to the annotation")
+            end
         end,
-        onMenuHold = function(_, item)
+        onMenuHold = function(__, item)
             local ann = item.ann
             if ann == nil then
                 return true
             end
             UIManager:show(ConfirmBox:new({
-                text = _("Delete this annotation?"),
+                text = ann.zoteroKey
+                    and _("Delete this annotation?\n\nIt will also be deleted in Zotero at the next sync.")
+                    or _("Delete this annotation?"),
                 ok_text = _("Delete"),
                 ok_callback = function()
-                    local idx = item.index
-                    if ui.annotation and ui.annotation.annotations and idx then
-                        table.remove(ui.annotation.annotations, idx)
-                        if ui.annotation.onAnnotationsModified then
-                            pcall(function()
-                                ui.annotation:onAnnotationsModified()
-                            end)
-                        elseif ui.doc_settings then
-                            ui.doc_settings:saveSetting("annotations", ui.annotation.annotations)
-                            ui.doc_settings:flush()
+                    -- Find it again (the list may have changed) and delete it
+                    -- through the reader, so that everything that depends on
+                    -- it - the page display, statistics, the sync's delete
+                    -- log - is told.
+                    local list = ui.annotation and ui.annotation.annotations or {}
+                    local idx
+                    for i, a in ipairs(list) do
+                        if a == ann then
+                            idx = i
+                            break
+                        end
+                    end
+                    if idx then
+                        if ann.drawer and ui.highlight and ui.highlight.deleteHighlight then
+                            ui.highlight:deleteHighlight(idx)
+                        elseif ui.bookmark and ui.bookmark.removeItemByIndex then
+                            ui.bookmark:removeItemByIndex(idx)
                         end
                         UIManager:close(menu)
                         AnnotationPanel.show(ui, { filter = filter })

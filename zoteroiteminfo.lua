@@ -103,7 +103,7 @@ local mimeTypes = {
 function itemInfo.formatCreators(creators)
 	if creators[1] ~= nil then
 		local authors = {}
-		for _, v in ipairs(creators) do
+		for __, v in ipairs(creators) do
 			if v.creatorType == "author" then
                 local name = v.name
                 if not name or name == "" then
@@ -121,7 +121,7 @@ end
 function itemInfo.formatTags(tagArray)
 	if tagArray[1] ~= nil then
 		local tags = {}
-		for _, v in ipairs(tagArray) do
+		for __, v in ipairs(tagArray) do
 			table.insert(tags, v.tag)
 		end
 		return table.concat(tags, ", ")
@@ -236,4 +236,5 @@ function itemInfo:showBookProp(prop_key, prop_text)
 end
 
 
+itemInfo.fork = "0.6"
 return itemInfo
