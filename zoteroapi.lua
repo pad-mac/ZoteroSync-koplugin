@@ -11,12 +11,14 @@ local Annotations = require("annotations")
 local Util = require("zotero_util")
 local _ = require("gettext")
 local DocSettings = require("docsettings")
+local Bg = require("zotero_bg")
+local Dav = require("zotero_webdav")
 
-local API = { version = "Zotero Atelier 2.0 fork v0.12 (2026-10-24)", fork = "0.6" }
+local API = { version = "Zotero Atelier 2.0 fork v0.13 (2026-10-24)", fork = "0.6" }
 -- what a sync that the user stopped reports
 API.CANCELLED = "Sync stopped."
 local ZOTERO_BASE_URL = "https://api.zotero.org"
-local DB_VERSION = 2
+local DB_VERSION = 3
 local SUPPORTED_MEDIA_TYPES = {
     [1] = "application/pdf",
     [2] = "application/epub+zip",
@@ -144,6 +146,7 @@ local function url_encode(s)
     end)
 end
 
+local http_plain = require("socket.http")
 local function content_headers(headers, body)
     local h = copy_table(headers)
     h["content-type"] = "application/json"
@@ -190,10 +193,25 @@ function API.openDB()
         -- the server once (see fetchZoteroItems: versions are compared, only
         -- what differs is downloaded; nothing stored here is thrown away).
         API.db:exec("UPDATE libraries SET version=0 WHERE libraryID=1;")
-        API.db:exec("PRAGMA user_version=" .. tostring(DB_VERSION))
+        API.db:exec("PRAGMA user_version=2")
         API.needs_storage_scan = true
         API.libVersion = nil
+        version = 2
     end
+    if version < 3 then
+        -- group libraries: a row in libraries each, with the group's ID
+        if not API.db:rowexec("SELECT 1 FROM pragma_table_info('libraries') WHERE name='groupID'") then
+            API.db:exec("ALTER TABLE libraries ADD COLUMN groupID INT NOT NULL DEFAULT 0;")
+        end
+        API.db:exec("CREATE INDEX IF NOT EXISTS idx_items_library ON items(libraryID);")
+        API.db:exec("PRAGMA user_version=" .. tostring(DB_VERSION))
+    end
+    -- What this device knows about each attachment beyond the library itself
+    -- (zoteroapi: attachment state): when its file's details were last noted
+    -- in the document, the state of both sides after the last complete
+    -- annotation sync (a document neither side changed since is skipped), a
+    -- download that failed because the server has no file.
+    API.db:exec("CREATE TABLE IF NOT EXISTS attachmentState (key TEXT PRIMARY KEY, info TEXT, annLocal TEXT, annRemote TEXT, failVersion INT NOT NULL DEFAULT 0, failCode INT NOT NULL DEFAULT 0, failAt INT NOT NULL DEFAULT 0);")
     return API.db
 end
 
@@ -201,6 +219,7 @@ function API.closeDB()
     if API.db then API.db:close() end
     API.db = nil
     API.libVersion = nil
+    API.forgetLibraries()
 end
 
 function API.init(zotero_dir)
@@ -236,6 +255,7 @@ function API.getStats()
         items = i,
         attachments = a,
         annotations = n,
+        groups = tonumber(db:rowexec("SELECT COUNT(*) FROM libraries WHERE type='group'")) or 0,
     }
 end
 
@@ -270,6 +290,7 @@ function API.setUserLibraryVersion(v)
     API.libVersion = v
     local stmt = API.openDB():prepare("UPDATE libraries SET version=?,lastSync=unixepoch('now') WHERE libraryID=1")
     stmt:bind(v):step(); stmt:close()
+    API.forgetLibraries()
 end
 
 function API.getLinkedFilesEnabled() return API.settings:isTrue("linked_files_enabled") end
@@ -415,6 +436,53 @@ end
 -- @param for_key the attachment the file is wanted for: a file that sits in
 --        the storage folder of ANOTHER attachment is that attachment's file,
 --        however alike the names are, and is not taken.
+--- The folders searched for a file by its name: those the user configured
+-- (linked file folders, search folders). The storage folders are not among
+-- them: a file there sits in its attachment's own folder, where it is found
+-- without a search.
+function API.nameSearchRoots()
+    local out = {}
+    local function add(v) if v and v ~= "" then table.insert(out, v) end end
+    for __, v in ipairs(API.getLinkedFilesBases()) do add(v) end
+    for __, v in ipairs(API.getSearchRoots()) do add(v) end
+    return out
+end
+
+-- While a sync looks for many files, each folder is walked once: file name
+-- (lower case) -> paths, in the order a search would meet them.
+local file_index, file_index_depth = nil, 0
+function API.beginFileIndex()
+    file_index_depth = file_index_depth + 1
+    if file_index_depth == 1 then file_index = {} end
+end
+function API.endFileIndex()
+    file_index_depth = math.max(0, file_index_depth - 1)
+    if file_index_depth == 0 then file_index = nil end
+end
+local function index_folder(root)
+    local idx = {}
+    local function walk(dir, depth)
+        if depth > 8 then return end
+        local ok, iter, state = pcall(lfs.dir, dir)
+        if not ok then return end
+        for name in iter, state do
+            if name ~= "." and name ~= ".." then
+                local p = BaseUtil.joinPath(dir, name)
+                local mode = lfs.attributes(p, "mode")
+                if mode == "file" then
+                    local k = string.lower(name)
+                    idx[k] = idx[k] or {}
+                    table.insert(idx[k], API.normalizePath(p))
+                elseif mode == "directory" then
+                    walk(p, depth + 1)
+                end
+            end
+        end
+    end
+    if file_exists(root) then walk(root, 0) end
+    return idx
+end
+
 function API.findAttachmentByBasename(name, for_key)
     local base = API.basenameOfPath(name) or name
     local reject
@@ -424,7 +492,16 @@ function API.findAttachmentByBasename(name, for_key)
             return owner ~= nil and owner ~= for_key
         end
     end
-    for __, root in ipairs(API.collectSearchRoots()) do local f = API.findFileByBasename(root, base, 0, reject); if f then return f end end
+    for __, root in ipairs(API.nameSearchRoots()) do
+        if file_index then
+            file_index[root] = file_index[root] or index_folder(root)
+            for __, p in ipairs(file_index[root][string.lower(base)] or {}) do
+                if not (reject and reject(p)) and file_exists(p) then return p end
+            end
+        else
+            local f = API.findFileByBasename(root, base, 0, reject); if f then return f end
+        end
+    end
     return nil
 end
 --- @param strict only the place the path itself names: no search by file name
@@ -721,9 +798,85 @@ do
     if ok and type(mod) == "table" and mod.set_timeout then socketutil = mod end
 end
 
-local function nap(seconds)
-    seconds = math.max(0, math.min(tonumber(seconds) or 0, 20))
-    if seconds > 0 then pcall(BaseUtil.sleep, seconds) end
+--- One HTTP exchange, as plain data in and out: it runs here, or in a child
+-- process while a background job waits for it (zotero_bg.lua).
+-- spec = { method, url, headers, body (string),
+--          file = path the body is written to (else it is returned),
+--          redirect = false (a redirect is returned, not followed),
+--          block_timeout, total_timeout (seconds; -1: none) }
+-- @return { code =, headers = (lower-case names), body = }  or  { err = }
+function API.exchange(spec)
+    local headers = copy_table(spec.headers)
+    local req = { method = spec.method or "GET", url = spec.url, headers = headers }
+    if spec.redirect == false then req.redirect = false end
+    if spec.body then
+        headers["content-type"] = headers["content-type"] or "application/json"
+        headers["content-length"] = tostring(#spec.body)
+        req.source = ltn12.source.string(spec.body)
+    end
+    if socketutil then socketutil:set_timeout(spec.block_timeout or 20, spec.total_timeout or 180) end
+    local chunks, f = {}, nil
+    if spec.file then
+        f = io.open(spec.file, "wb")
+        if not f then
+            if socketutil then socketutil:reset_timeout() end
+            return { err = "could not create " .. tostring(spec.file) }
+        end
+        req.sink = socketutil and socketutil.file_sink(f) or ltn12.sink.file(f)
+    else
+        req.sink = socketutil and socketutil.table_sink(chunks) or ltn12.sink.table(chunks)
+    end
+    -- (a WebDAV server may well be reached without TLS)
+    local module = tostring(spec.url):lower():match("^http://") and http_plain or https
+    local ok, r, c, h = pcall(module.request, req)
+    if socketutil then socketutil:reset_timeout() end
+    if f then pcall(f.close, f) end -- (the sink closes it when the body is complete)
+    if not ok then return { err = tostring(r) } end
+    if r ~= 1 then return { err = tostring(c) } end
+    local out = { code = tonumber(c) or 0, headers = {} }
+    for k, v in pairs(h or {}) do out.headers[string.lower(tostring(k))] = tostring(v) end
+    if not spec.file then out.body = table.concat(chunks) end
+    return out
+end
+
+local function wait_backoff()
+    if API.backoff_until then
+        local wait = API.backoff_until - os.time()
+        API.backoff_until = nil
+        if wait > 0 then Bg.sleep(math.min(wait, 20)) end
+    end
+end
+
+local function note_backoff(res)
+    local b = res.headers and tonumber(res.headers["backoff"])
+    if b then
+        -- the server asks clients to slow down
+        API.backoff_until = os.time() + math.min(b, 20)
+    end
+end
+
+--- Several requests, up to `limit` at once (in a background job; one after
+-- the other otherwise). A request the server refuses for being busy (429,
+-- 503) is repeated, up to twice.
+-- @return the answers, as API.exchange gives them, in order
+function API.requestMany(specs, limit)
+    wait_backoff()
+    local tasks = {}
+    for i, spec in ipairs(specs) do tasks[i] = { fn = API.exchange, args = { spec, n = 1 }, poll = spec.poll } end
+    local results = Bg.run(tasks, limit or 4)
+    for i, res in ipairs(results) do
+        local tries = 1
+        note_backoff(res)
+        while (res.code == 429 or res.code == 503) and tries < 3 do
+            tries = tries + 1
+            Bg.sleep(math.max(0, math.min(tonumber(res.headers and res.headers["retry-after"]) or 5, 20)))
+            if Bg.stopped() then break end
+            res = Bg.call(API.exchange, specs[i])
+            note_backoff(res)
+        end
+        results[i] = res
+    end
+    return results
 end
 
 --- One request to the Zotero API.
@@ -731,66 +884,56 @@ end
 -- @return status code, response headers (lower-case names), response body
 --         or nil, error message when the request did not get an answer
 function API.request(opts)
-    local tries = 0
-    while true do
-        tries = tries + 1
-        if API.backoff_until then
-            nap(API.backoff_until - os.time())
-            API.backoff_until = nil
-        end
-        local headers = copy_table(opts.headers)
-        local req = { method = opts.method or "GET", url = opts.url, headers = headers }
-        if opts.body then
-            headers["content-type"] = headers["content-type"] or "application/json"
-            headers["content-length"] = tostring(#opts.body)
-            req.source = ltn12.source.string(opts.body)
-        end
-        local chunks = {}
-        if socketutil then
-            socketutil:set_timeout(20, 180)
-            req.sink = socketutil.table_sink(chunks)
-        else
-            req.sink = ltn12.sink.table(chunks)
-        end
-        local ok, r, c, h = pcall(https.request, req)
-        if socketutil then socketutil:reset_timeout() end
-        if not ok then return nil, tostring(r) end
-        if r ~= 1 then return nil, tostring(c) end
-        local code = tonumber(c)
-        h = h or {}
-        if h["backoff"] then
-            -- the server asks clients to slow down
-            API.backoff_until = os.time() + math.min(tonumber(h["backoff"]) or 0, 20)
-        end
-        if (code == 429 or code == 503) and tries < 3 then
-            nap(tonumber(h["retry-after"]) or 5)
-        else
-            return code, h, table.concat(chunks)
-        end
+    local res = API.requestMany({ opts }, 1)[1]
+    if res.err then return nil, res.err end
+    return res.code, res.headers or {}, res.body
+end
+
+--- An answer as JSON. @return decoded value, response headers  or  nil, error, status code
+local function decode_answer(res, url)
+    if res.err then
+        logger.warn("Zotero: request failed", url, res.err)
+        return nil, "Error: " .. tostring(res.err)
     end
+    local code = res.code or 0
+    if code < 200 or code >= 300 then
+        local e = "Error: API responded with status code " .. tostring(code)
+        if code == 403 then e = e .. " (access denied: check the API key and its permissions)" end
+        logger.warn("Zotero: GET failed", url, e)
+        return nil, e, code
+    end
+    local result, decode_err = Util.jsonDecode(res.body)
+    if result == nil then
+        local msg = "Error: Zotero returned an empty or undecodable JSON response: " .. tostring(decode_err)
+        logger.warn("Zotero:", msg, "URL:", url, "body:", tostring(res.body):sub(1, 300))
+        return nil, msg
+    end
+    return result, res.headers or {}
 end
 
 --- GET a JSON document. @return decoded value, response headers  or  nil, error
 function API.getZoteroData(url)
     if not API.zoteroHeader then return nil,"Error: Zotero header not set. Check user ID and API key" end
-    local code, h, raw = API.request{ method = "GET", url = url, headers = API.zoteroHeader }
-    if not code then
-        logger.warn("Zotero: GET failed", url, h)
-        return nil, "Error: " .. tostring(h)
+    local res = API.requestMany({ { method = "GET", url = url, headers = API.zoteroHeader } }, 1)[1]
+    return decode_answer(res, url)
+end
+
+--- GET several JSON documents, up to four at once.
+-- @return { { value =, headers = } | { err =, code = } ... }
+function API.getMany(urls)
+    if not API.zoteroHeader then
+        local out = {}
+        for i = 1, #urls do out[i] = { err = "Error: Zotero header not set. Check user ID and API key" } end
+        return out
     end
-    if code < 200 or code >= 300 then
-        local e = "Error: API responded with status code " .. tostring(code)
-        if code == 403 then e = e .. " (access denied: check the API key and its permissions)" end
-        logger.warn("Zotero: GET failed", url, e)
-        return nil, e
+    local specs = {}
+    for i, url in ipairs(urls) do specs[i] = { method = "GET", url = url, headers = API.zoteroHeader } end
+    local out = {}
+    for i, res in ipairs(API.requestMany(specs, 4)) do
+        local value, h, code = decode_answer(res, urls[i])
+        if value == nil then out[i] = { err = h, code = code } else out[i] = { value = value, headers = h } end
     end
-    local result, decode_err = Util.jsonDecode(raw)
-    if result == nil then
-        local msg = "Error: Zotero returned an empty or undecodable JSON response: " .. tostring(decode_err)
-        logger.warn("Zotero:", msg, "URL:", url, "body:", tostring(raw):sub(1, 300))
-        return nil, msg
-    end
-    return result, h or {}
+    return out
 end
 function API.checkZoteroKey(url)
     if API.access then return API.access end
@@ -816,10 +959,108 @@ function API.verifyZoteroAccess()
     API.zoteroAcessVerified=true
     return nil
 end
---- May this API key change the library?
-function API.canWrite()
+-- ---------------------------------------------------------------------------
+-- Libraries: the user's own (libraryID 1, root collection "/") and the group
+-- libraries the API key can read (root collection "/g<groupID>"). Item and
+-- collection keys are drawn at random from 32^8: the same key in two
+-- libraries does not happen, so objects are looked up by key alone.
+-- ---------------------------------------------------------------------------
+
+local libs_by_id
+function API.forgetLibraries() libs_by_id = nil end
+local function load_libraries()
+    libs_by_id = {}
+    local st = API.openDB():prepare("SELECT libraryID,type,groupID,name,version,editable FROM libraries ORDER BY libraryID")
+    local row = st:step()
+    while row do
+        local lid, gid = tonumber(row[1]), tonumber(row[3]) or 0
+        local lib = { id = lid, type = row[2], groupID = gid, name = row[4] or "", version = tonumber(row[5]) or 0,
+            editable = (tonumber(row[6]) or 0) ~= 0 }
+        if lib.type == "group" and gid > 0 then
+            lib.root = "/g" .. gid
+            lib.prefix = "/groups/" .. gid
+            lib.setting_prefix = "lastPageIndex_g" .. gid .. "_"
+        else
+            lib.root = "/"
+            lib.setting_prefix = "lastPageIndex_u_"
+        end
+        libs_by_id[lid] = lib
+        row = st:step(row)
+    end
+    st:close()
+end
+--- A library by its ID (1: the user's own).
+function API.library(lid)
+    if not libs_by_id then load_libraries() end
+    return libs_by_id[tonumber(lid) or 1] or libs_by_id[1]
+end
+--- All libraries: the user's own first, then the groups by name.
+function API.libraries()
+    if not libs_by_id then load_libraries() end
+    local out = {}
+    for _, lib in pairs(libs_by_id) do out[#out + 1] = lib end
+    table.sort(out, function(a, b)
+        if (a.type == "group") ~= (b.type == "group") then return a.type ~= "group" end
+        if a.type ~= "group" then return a.id < b.id end
+        local na, nb = string.lower(a.name), string.lower(b.name)
+        if na ~= nb then return na < nb end
+        return a.id < b.id
+    end)
+    return out
+end
+function API.groupLibraries()
+    local out = {}
+    for _, lib in ipairs(API.libraries()) do if lib.type == "group" then out[#out + 1] = lib end end
+    return out
+end
+--- The library of a group, or nil.
+function API.groupLibrary(gid)
+    for _, lib in ipairs(API.groupLibraries()) do if lib.groupID == tonumber(gid) then return lib end end
+    return nil
+end
+--- The address of a library in the web API.
+function API.libraryURL(lib)
+    lib = lib or API.library(1)
+    if lib.prefix then return ZOTERO_BASE_URL .. lib.prefix end
+    return API.userLibraryURL or (ZOTERO_BASE_URL .. "/users/" .. tostring(API.getUserID()))
+end
+--- The library an item (or collection) belongs to; the user's own if it is
+-- not known here.
+function API.libraryOfKey(key)
+    local db = API.openDB()
+    local st = db:prepare("SELECT libraryID FROM items WHERE key=? UNION ALL SELECT libraryID FROM collections WHERE key=? LIMIT 1")
+    local row = st:bind(key, key):step()
+    local lid = row and tonumber(row[1]) or 1
+    st:close()
+    return API.library(lid)
+end
+local function set_library_version(lib, v)
+    local st = API.openDB():prepare("UPDATE libraries SET version=?,lastSync=unixepoch('now') WHERE libraryID=?")
+    st:bind(tonumber(v) or 0, lib.id):step(); st:close()
+    lib.version = tonumber(v) or 0
+    if lib.id == 1 then API.libVersion = lib.version end
+end
+
+--- May this API key change the library (the user's own, if none is named)?
+-- @param lib a library, or an item key
+function API.canWrite(lib)
     local a = API.access
-    return type(a) == "table" and type(a.user) == "table" and a.user.write == true
+    if type(a) ~= "table" then return false end
+    if type(lib) == "string" then lib = API.libraryOfKey(lib) end
+    if not lib or lib.type ~= "group" then
+        return type(a.user) == "table" and a.user.write == true
+    end
+    local g = type(a.groups) == "table" and (a.groups[tostring(lib.groupID)] or a.groups.all) or nil
+    return type(g) == "table" and g.write == true and lib.editable
+end
+--- May this API key read group libraries at all?
+local function group_access()
+    local a = API.access
+    return type(a) == "table" and type(a.groups) == "table" and next(a.groups) ~= nil
+end
+local function may_read_group(gid)
+    local g = API.access.groups[tostring(gid)] or API.access.groups.all
+    return type(g) == "table" and g.library ~= false
 end
 function API.fetchCollectionSize(url, headers)
     local code, h = API.request{ method = "HEAD", url = url, headers = headers }
@@ -875,11 +1116,30 @@ local function type_id(type_name)
     end
     return id or nil
 end
-local function upsert_item(item)
-    if not item or not item.key or not item.data then return end
+local warned_collision = {}
+--- Store an item as the server sent it.
+-- @param lid its library (default: the library it is stored in already, else
+--        the library of its parent, else the user's)
+-- @return false if it was not stored (its key belongs to another library here)
+local function upsert_item(item, lid)
+    if not item or not item.key or not item.data then return false end
     local db=API.openDB(); local tid=type_id(item.data.itemType) or type_id("document") or 13
-    local stmt=db:prepare([[INSERT INTO items(itemTypeID,libraryID,key,version) VALUES(?,1,?,?) ON CONFLICT(libraryID,key) DO UPDATE SET itemTypeID=excluded.itemTypeID,version=excluded.version]])
-    stmt:bind(tid,item.key,tonumber(item.version) or 0):step(); stmt:close()
+    local here=tonumber(db:rowexec("SELECT libraryID FROM items WHERE key='"..tostring(item.key):gsub("'","''").."' LIMIT 1"))
+    if lid==nil then
+        lid=here
+        if not lid and type(item.data.parentItem)=="string" then lid=API.libraryOfKey(item.data.parentItem).id end
+        lid=lid or 1
+    elseif here and here~=lid then
+        -- (32^8 possible keys: this does not happen, but if it did, the two
+        -- items must not be mixed up)
+        if not warned_collision[item.key] then
+            warned_collision[item.key]=true
+            logger.warn("Zotero: item key", item.key, "exists in two libraries; the one in library", lid, "is left out")
+        end
+        return false
+    end
+    local stmt=db:prepare([[INSERT INTO items(itemTypeID,libraryID,key,version) VALUES(?,?,?,?) ON CONFLICT(libraryID,key) DO UPDATE SET itemTypeID=excluded.itemTypeID,version=excluded.version]])
+    stmt:bind(tid,lid,item.key,tonumber(item.version) or 0):step(); stmt:close()
     stmt=db:prepare([[INSERT INTO itemData(itemID,value) SELECT itemID,? FROM items WHERE key=? ON CONFLICT(itemID) DO UPDATE SET value=excluded.value]])
     stmt:bind(JSON.encode(item),item.key):step(); stmt:close()
     -- it exists (again): no longer "deleted on the server"
@@ -889,6 +1149,7 @@ local function upsert_item(item)
         -- children did not come with it, see relink_orphans
         API.restored_seen = true
     end
+    return true
 end
 --- Remove an item from the local library.
 -- @param reported true when the server said it was deleted. That is kept as
@@ -966,179 +1227,612 @@ function API.setAnnotations(map)
     stmt:close()
 end
 
-function API.fetchZoteroCollections(since, progress_callback)
-    since=tonumber(since) or API.getUserLibraryVersion(); local e=API.verifyZoteroAccess(); if e then return nil,e end
-    local callback=progress_callback or function() end
-    local url=API.userLibraryURL.."/collections?since="..since.."&format=json"
-    local nested={}
-    local version,err=API.fetchCollectionPaginated(url,API.zoteroHeader,function(entries, pct)
-        if callback(string.format("Syncing collections %.0f%%",pct))==false then return false end
-        local db=API.openDB()
-        for __,entry in ipairs(entries) do
-            local c=entry.data or entry
-            if c.deleted then
-                local st=db:prepare("DELETE FROM collections WHERE key=?"); st:bind(c.key or entry.key):step(); st:close()
-            else
-                local key=c.key or entry.key; local parent=c.parentCollection or "/"
-                if parent~="/" then nested[key]=parent; parent="/" end
-                local st=db:prepare([[INSERT INTO collections(collectionName,parentCollectionID,libraryID,key,version) SELECT ?,collectionID,1,?,? FROM collections WHERE key=? ON CONFLICT(libraryID,key) DO UPDATE SET collectionName=excluded.collectionName,version=excluded.version,parentCollectionID=excluded.parentCollectionID]])
-                st:bind(c.name or "",key,tonumber(c.version or entry.version) or 0,parent):step(); st:close()
-            end
-        end
-    end)
-    -- (also when the download stopped half-way: what was stored gets its place)
-    local db=API.openDB(); local st=db:prepare("UPDATE collections SET parentCollectionID=(SELECT collectionID FROM collections WHERE key=?) WHERE key=? AND EXISTS(SELECT 1 FROM collections WHERE key=?)")
-    for child,parent in pairs(nested) do st:reset():bind(parent,child,parent):step() end; st:close()
-    if err then return nil,err end
-    return tonumber(version) or since,nil
+-- ---------------------------------------------------------------------------
+-- Downloading what changed
+--
+-- One round of requests, all at once: for every library the versions of the
+-- items changed since its last sync (a library nothing happened to answers
+-- with its old version: done), the list of groups, the reading positions.
+-- Then, for the libraries that changed, what changed in their collections and
+-- what was deleted; then the changed objects themselves, 50 per request, four
+-- requests at a time. A library's version only moves forward when all of its
+-- requests succeeded, to the lowest version any of them reported: whatever
+-- changed meanwhile is fetched again next time.
+-- ---------------------------------------------------------------------------
+
+local BATCH = 50 -- objects per request: the most the API takes by key
+
+local function lmv(headers)
+    return tonumber(type(headers) == "table" and headers["last-modified-version"])
+end
+local function count_keys(t)
+    local n = 0
+    for __ in pairs(t) do n = n + 1 end
+    return n
+end
+--- Is a version list the whole answer? (it is not paged; the header says how
+-- many there are)
+local function complete(map, headers)
+    if type(map) ~= "table" then return false end
+    local total = tonumber(type(headers) == "table" and headers["total-results"])
+    return total == nil or total == count_keys(map)
 end
 
-function API.fetchZoteroItems(since, progress_callback)
-    since=tonumber(since) or API.getUserLibraryVersion(); local e=API.verifyZoteroAccess(); if e then return nil,e end
-    local callback=progress_callback or function() end
-    local db=API.openDB()
-    local lowest
-    local function seen(v) v=tonumber(v); if v and (not lowest or v<lowest) then lowest=v end end
+local function new_ctx(lib)
+    return { lib = lib, seen = {}, attachments = {}, annotations = {}, nested = {}, lowest = nil }
+end
+local function seen_version(ctx, v)
+    v = tonumber(v)
+    if v and (not ctx.lowest or v < ctx.lowest) then ctx.lowest = v end
+end
 
-    local attachments,annotations={},{}
-    local seen_keys={} -- listed as existing by this very download
-    API.restored_seen=nil
-    local colstmt_del=db:prepare("DELETE FROM collectionItems WHERE itemID=(SELECT itemID FROM items WHERE key=?)")
-    local colstmt=db:prepare([[INSERT OR IGNORE INTO collectionItems(collectionID,itemID) SELECT collections.collectionID,items.itemID FROM collections,items WHERE collections.key=? AND items.key=?]])
-    local function close_statements() colstmt_del:close(); colstmt:close() end
+--- Store collections of a library as the server sent them.
+local function store_collections(ctx, entries)
+    local lib, db = ctx.lib, API.openDB()
+    db:exec("BEGIN")
+    local ok, err = pcall(function()
+        local del = db:prepare("DELETE FROM collections WHERE key=? AND libraryID=?")
+        local ins = db:prepare([[INSERT INTO collections(collectionName,parentCollectionID,libraryID,key,version) SELECT ?,collectionID,?,?,? FROM collections WHERE key=? ON CONFLICT(libraryID,key) DO UPDATE SET collectionName=excluded.collectionName,version=excluded.version,parentCollectionID=excluded.parentCollectionID]])
+        for __, entry in ipairs(entries) do
+            local c = entry.data or entry
+            local key = c.key or entry.key
+            if key and c.deleted then
+                del:reset():bind(key, lib.id):step()
+            elseif key then
+                local parent = c.parentCollection
+                if type(parent) ~= "string" or parent == "" then parent = lib.root end
+                if parent ~= lib.root then ctx.nested[key] = parent; parent = lib.root end
+                ins:reset():bind(c.name or "", lib.id, key, tonumber(c.version or entry.version) or 0, parent):step()
+            end
+        end
+        del:close(); ins:close()
+    end)
+    db:exec(ok and "COMMIT" or "ROLLBACK")
+    if not ok then return tostring(err) end
+    return nil
+end
 
-    --- Store a batch of items as the server sent them. One transaction per
-    -- batch: far fewer disk syncs. @return nil, or an error message
-    local function store(entries)
-        db:exec("BEGIN")
-        local done,perr=pcall(function()
-            for __,item in ipairs(entries) do
-                if item.key then
-                    local d=item.data
-                    if d and d.deleted and d.deleted~=0 then
-                        delete_item(item.key,true,item)
-                    elseif d then
-                        seen_keys[item.key]=true
-                        item.links=nil; item.library=nil; upsert_item(item)
-                        -- This item's place in the index. Only what changed is
-                        -- touched: no rebuild of the whole library's index.
-                        colstmt_del:reset():bind(item.key):step()
-                        local cols=type(d.collections)=="table" and d.collections or {}
-                        if #cols==0 then
-                            colstmt:reset():bind("/",item.key):step()
+--- Place nested collections under their parents (whatever order they came in).
+local function place_collections(ctx)
+    if next(ctx.nested) == nil then return end
+    local st = API.openDB():prepare("UPDATE collections SET parentCollectionID=(SELECT collectionID FROM collections WHERE key=?) WHERE key=? AND EXISTS(SELECT 1 FROM collections WHERE key=?)")
+    for child, parent in pairs(ctx.nested) do st:reset():bind(parent, child, parent):step() end
+    st:close()
+end
+
+--- Store a batch of items as the server sent them. One transaction per
+-- batch: far fewer disk syncs. @return nil, or an error message
+local function store_items(ctx, entries)
+    local lib, db = ctx.lib, API.openDB()
+    db:exec("BEGIN")
+    local done, perr = pcall(function()
+        local del = db:prepare("DELETE FROM collectionItems WHERE itemID=(SELECT itemID FROM items WHERE key=?)")
+        local ins = db:prepare([[INSERT OR IGNORE INTO collectionItems(collectionID,itemID) SELECT collections.collectionID,items.itemID FROM collections,items WHERE collections.key=? AND items.key=?]])
+        for __, item in ipairs(entries) do
+            if type(item) == "table" and item.key then
+                local d = item.data
+                if type(d) == "table" and d.deleted and d.deleted ~= 0 then
+                    delete_item(item.key, true, item)
+                elseif type(d) == "table" then
+                    ctx.seen[item.key] = true
+                    local enclosure = type(item.links) == "table" and item.links.enclosure
+                    local length = type(enclosure) == "table" and tonumber(enclosure.length) or nil
+                    item.links = nil; item.library = nil
+                    if length then item.fileLength = length end
+                    if upsert_item(item, lib.id) then
+                        -- this item's place in the index; only what changed is touched
+                        del:reset():bind(item.key):step()
+                        local cols = type(d.collections) == "table" and d.collections or {}
+                        if #cols == 0 then
+                            ins:reset():bind(lib.root, item.key):step()
                         else
-                            for __,c in ipairs(cols) do colstmt:reset():bind(c,item.key):step() end
+                            for __, c in ipairs(cols) do ins:reset():bind(c, item.key):step() end
                         end
-                        if d.itemType=="attachment" and (table_contains(SUPPORTED_MEDIA_TYPES,d.contentType) or API.attachmentKind(d)) then
-                            attachments[item.key]=d.parentItem or item.key
-                        elseif d.itemType=="annotation" and d.parentItem then
-                            annotations[item.key]=d.parentItem
+                        if d.itemType == "attachment" and (table_contains(SUPPORTED_MEDIA_TYPES, d.contentType) or API.attachmentKind(d)) then
+                            ctx.attachments[item.key] = d.parentItem or item.key
+                        elseif d.itemType == "annotation" and d.parentItem then
+                            ctx.annotations[item.key] = d.parentItem
                         end
                     end
                 end
             end
-        end)
-        db:exec(done and "COMMIT" or "ROLLBACK")
-        if not done then return tostring(perr) end
-        return nil
-    end
-
-    -- A library that is already stored here is not downloaded again from the
-    -- start: its item versions are compared with the server's, and only what
-    -- differs is fetched. (This is the case after an update of the plugin,
-    -- which asks for the whole library to be checked once.)
-    local trashed
-    local compared=false
-    if since==0 and (tonumber(db:rowexec("SELECT COUNT(*) FROM items")) or 0)>0 then
-        if callback("Comparing with the Zotero library…")==false then close_statements(); return nil,API.CANCELLED end
-        local live,h1=API.getZoteroData(API.userLibraryURL.."/items?format=versions")
-        if type(live)~="table" then close_statements(); return nil,h1 end
-        local all,h2=API.getZoteroData(API.userLibraryURL.."/items?format=versions&includeTrashed=1")
-        if type(all)~="table" then close_statements(); return nil,h2 end
-        local n_live,n_all=0,0
-        for __ in pairs(live) do n_live=n_live+1 end
-        for __ in pairs(all) do n_all=n_all+1 end
-        local t1,t2=tonumber(h1["total-results"]),tonumber(h2["total-results"])
-        if (t1==nil or t1==n_live) and (t2==nil or t2==n_all) and n_all>=n_live then
-            compared=true
-            seen(h1["last-modified-version"]); seen(h2["last-modified-version"])
-            local have={}
-            local st=db:prepare("SELECT key,version FROM items")
-            local row=st:step()
-            while row do have[row[1]]=tonumber(row[2]) or 0; row=st:step(row) end
-            st:close()
-            local wanted={}
-            for key,version in pairs(live) do
-                if Util.isValidKey(key) and have[key]~=tonumber(version) then wanted[#wanted+1]=key end
-            end
-            table.sort(wanted)
-            trashed={}
-            for key in pairs(all) do
-                if live[key]==nil then trashed[#trashed+1]=key end
-            end
-            logger.info("Zotero: library compared:", n_live, "items on the server,", #wanted, "to fetch,", #trashed, "in the trash")
-            local BATCH=50
-            for start=1,#wanted,BATCH do
-                if callback(string.format("Syncing items %.0f%%",100*(start-1)/#wanted))==false then close_statements(); return nil,API.CANCELLED end
-                local keys={}
-                for i=start,math.min(start+BATCH-1,#wanted) do keys[#keys+1]=wanted[i] end
-                local result,h=API.getZoteroData(API.userLibraryURL.."/items?format=json&includeTrashed=1&itemKey="..table.concat(keys,","))
-                if type(result)~="table" then close_statements(); return nil,h end
-                seen(h["last-modified-version"])
-                local serr=store(result)
-                if serr then close_statements(); return nil,"Error: could not store items: "..serr end
-            end
-        else
-            logger.warn("Zotero: the server's item list looks incomplete (", n_live, t1, n_all, t2, "); downloading the library page by page instead")
         end
-    end
+        del:close(); ins:close()
+    end)
+    db:exec(done and "COMMIT" or "ROLLBACK")
+    if not done then return tostring(perr) end
+    return nil
+end
 
-    if not compared then
-        -- Items in the trash are only listed on request. Without them, an item
-        -- (or annotation) moved to the trash in Zotero would stay here forever.
-        local url=API.userLibraryURL.."/items?since="..since.."&format=json&includeTrashed=1"
-        local page_error
-        local ok,version,err=pcall(API.fetchCollectionPaginated,url,API.zoteroHeader,function(entries, pct)
-            if callback(string.format("Syncing items %.0f%%",pct))==false then return false end
-            if page_error then return end
-            page_error=store(entries)
-        end)
-        if not ok then close_statements(); return nil,"Error: "..tostring(version) end
-        if err then close_statements(); return nil,err end
-        if page_error then close_statements(); return nil,"Error: could not store items: "..page_error end
-        seen(version)
-    end
-
-    local deleted,dh=API.getZoteroData(API.userLibraryURL.."/deleted?since="..since)
-    if type(deleted)~="table" then close_statements(); return nil,dh end
-    seen(type(dh)=="table" and dh["last-modified-version"])
-
-    callback("Updating local index…")
+--- After all of a library's objects are in: deletions, the index.
+-- @param gone keys of items the server does not have at all (a complete
+--        comparison found them), or nil
+local function finish_library(ctx, deleted, trashed, gone)
+    local lib, db = ctx.lib, API.openDB()
     db:exec("BEGIN")
-    local done,ierr=pcall(function()
+    local done, ierr = pcall(function()
         -- (an item this download listed as existing is not deleted on the
-        -- word of the delete log read just after it)
-        for __,key in ipairs(deleted.items or {}) do if not seen_keys[key] then delete_item(key,true) end end
-        -- items the comparison found in Zotero's trash
-        for __,key in ipairs(trashed or {}) do if not seen_keys[key] then delete_item(key,true) end end
-        local st=db:prepare("DELETE FROM collections WHERE key=?")
-        for __,key in ipairs(deleted.collections or {}) do st:reset():bind(key):step() end
+        -- word of the delete log read alongside)
+        for __, key in ipairs(type(deleted) == "table" and deleted.items or {}) do
+            if not ctx.seen[key] then delete_item(key, true) end
+        end
+        for __, key in ipairs(trashed or {}) do if not ctx.seen[key] then delete_item(key, true) end end
+        for __, key in ipairs(gone or {}) do if not ctx.seen[key] then delete_item(key, true) end end
+        local st = db:prepare("DELETE FROM collections WHERE key=? AND libraryID=?")
+        for __, key in ipairs(type(deleted) == "table" and deleted.collections or {}) do st:reset():bind(key, lib.id):step() end
         st:close()
-        -- parents exist now, whatever order the pages came in
-        API.setItemAttachments(attachments)
-        API.setAnnotations(annotations)
+        place_collections(ctx)
+        -- parents exist now, whatever order the batches came in
+        API.setItemAttachments(ctx.attachments)
+        API.setAnnotations(ctx.annotations)
         -- after a comparison: also index what an earlier version left out
-        if API.restored_seen or compared then relink_orphans() end
+        if API.restored_seen or ctx.compared then relink_orphans() end
         db:exec("DELETE FROM syncDeleted WHERE at < unixepoch('now') - 34560000") -- older than 400 days
     end)
     db:exec(done and "COMMIT" or "ROLLBACK")
-    close_statements()
-    if not done then return nil,"Error: could not update the local index: "..tostring(ierr) end
+    if not done then return "Error: could not update the local index: " .. tostring(ierr) end
+    return nil
+end
+
+--- The versions of a library's items stored here: { key = version }
+local function local_versions(lib, what)
+    local out = {}
+    local st = API.openDB():prepare(what == "collections"
+        and "SELECT key,version FROM collections WHERE libraryID=? AND key NOT LIKE '/%'"
+        or "SELECT key,version FROM items WHERE libraryID=?")
+    local row = st:bind(lib.id):step()
+    while row do out[row[1]] = tonumber(row[2]) or 0; row = st:step(row) end
+    st:close()
+    return out
+end
+
+-- ---------------------------------------------------------------------------
+-- Group libraries
+-- ---------------------------------------------------------------------------
+
+--- Sync group libraries at all? (setting; and the key must allow it)
+function API.groupsWanted()
+    if API.settings and API.settings:readSetting("sync_groups") == false then return false end
+    return group_access()
+end
+--- Groups left out by the user: { ["<groupID>"] = true }
+function API.skippedGroups()
+    local t = API.settings and API.settings:readSetting("groups_skipped")
+    return type(t) == "table" and t or {}
+end
+function API.setGroupSkipped(gid, skip)
+    local t = API.skippedGroups()
+    t[tostring(gid)] = skip and true or nil
+    API.settings:saveSetting("groups_skipped", t)
+end
+--- Groups the key can read, as last listed: { { id =, name = } } by name
+function API.knownGroups()
+    local names = API.settings and API.settings:readSetting("group_names")
+    local out = {}
+    for gid, name in pairs(type(names) == "table" and names or {}) do out[#out + 1] = { id = tonumber(gid), name = tostring(name) } end
+    table.sort(out, function(a, b) return string.lower(a.name) < string.lower(b.name) end)
+    return out
+end
+
+local function remove_library(lib)
+    local db = API.openDB()
+    db:exec("BEGIN")
+    local ok, err = pcall(function()
+        local st = db:prepare("DELETE FROM collections WHERE libraryID=?"); st:bind(lib.id):step(); st:close()
+        st = db:prepare("DELETE FROM items WHERE libraryID=?"); st:bind(lib.id):step(); st:close()
+        st = db:prepare("DELETE FROM libraries WHERE libraryID=?"); st:bind(lib.id):step(); st:close()
+    end)
+    db:exec(ok and "COMMIT" or "ROLLBACK")
+    API.forgetLibraries()
+    if ok then logger.info("Zotero: group library", lib.groupID, lib.name, "removed from this device") end
+    return ok, err
+end
+API._removeLibrary = remove_library
+
+--- A group's details as the API sends them (GET /groups/<id>) into its library.
+-- @return the library (created if new)
+local function store_group(gid, info)
+    local d = type(info) == "table" and (info.data or info) or {}
+    local db = API.openDB()
+    local uid = tonumber(API.getUserID()) or 0
+    local editable = true
+    if d.libraryEditing == "admins" then
+        editable = tonumber(d.owner) == uid
+        for __, a in ipairs(type(d.admins) == "table" and d.admins or {}) do if tonumber(a) == uid then editable = true end end
+    end
+    local name = type(d.name) == "string" and d.name ~= "" and d.name or ("Group " .. gid)
+    local version = tonumber(info and info.version or d.version) or 0
+    local lib = API.groupLibrary(gid)
+    if lib then
+        local st = db:prepare("UPDATE libraries SET name=?,editable=?,storageVersion=? WHERE libraryID=?")
+        st:bind(name, editable and 1 or 0, version, lib.id):step(); st:close()
+        st = db:prepare("UPDATE collections SET collectionName=? WHERE key=? AND libraryID=?")
+        st:bind(name, "/g" .. gid, lib.id):step(); st:close()
+    else
+        local st = db:prepare("INSERT INTO libraries(type,editable,name,userID,version,storageVersion,groupID) VALUES('group',?,?,?,0,?,?)")
+        st:bind(editable and 1 or 0, name, uid, version, gid):step(); st:close()
+        local lid = tonumber(db:rowexec("SELECT last_insert_rowid()"))
+        st = db:prepare("INSERT INTO collections(collectionName,libraryID,key) VALUES(?,?,?) ON CONFLICT(libraryID,key) DO NOTHING")
+        st:bind(name, lid, "/g" .. gid):step(); st:close()
+        logger.info("Zotero: group library", gid, name, "added")
+    end
+    API.forgetLibraries()
+    local names = API.settings:readSetting("group_names")
+    if type(names) ~= "table" then names = {} end
+    names[tostring(gid)] = name
+    API.settings:saveSetting("group_names", names)
+    return API.groupLibrary(gid)
+end
+
+--- The groups listing (GET /users/<id>/groups?format=versions: { id = version })
+-- against the libraries here: groups no longer there (or left out) go, new
+-- ones and those whose details changed are fetched.
+-- @return error message or nil
+local function update_groups(listing)
+    local skipped = API.skippedGroups()
+    local wanted = {}
+    for gid, version in pairs(listing) do
+        gid = tonumber(gid)
+        if gid and may_read_group(gid) and not skipped[tostring(gid)] then wanted[gid] = tonumber(version) or 0 end
+    end
+    -- names of all groups, for the settings (also those left out)
+    local fetch = {}
+    for __, lib in ipairs(API.groupLibraries()) do
+        if wanted[lib.groupID] == nil then
+            remove_library(lib)
+        end
+    end
+    local names = API.settings:readSetting("group_names")
+    if type(names) ~= "table" then names = {} end
+    for gid in pairs(listing) do
+        gid = tonumber(gid)
+        if gid then
+            local lib = API.groupLibrary(gid)
+            local stored = lib and tonumber(API.openDB():rowexec("SELECT storageVersion FROM libraries WHERE libraryID=" .. lib.id)) or -1
+            if (wanted[gid] and stored ~= wanted[gid]) or (not wanted[gid] and names[tostring(gid)] == nil) then
+                fetch[#fetch + 1] = gid
+            end
+        end
+    end
+    -- forget names of groups the key no longer lists
+    for gid in pairs(names) do if listing[gid] == nil and listing[tonumber(gid)] == nil then names[gid] = nil end end
+    API.settings:saveSetting("group_names", names)
+    if #fetch == 0 then return nil end
+    table.sort(fetch)
+    local urls = {}
+    for i, gid in ipairs(fetch) do urls[i] = ZOTERO_BASE_URL .. "/groups/" .. gid end
+    local answers = API.getMany(urls)
+    for i, gid in ipairs(fetch) do
+        local a = answers[i]
+        if a.value then
+            if wanted[gid] then
+                store_group(gid, a.value)
+            else
+                local d = a.value.data or a.value
+                names[tostring(gid)] = type(d.name) == "string" and d.name or ("Group " .. gid)
+                API.settings:saveSetting("group_names", names)
+            end
+        elseif wanted[gid] and not API.groupLibrary(gid) then
+            return a.err
+        elseif not wanted[gid] then
+            -- (a name to show; not asked for again at every sync)
+            names[tostring(gid)] = names[tostring(gid)] or ("Group " .. gid)
+            API.settings:saveSetting("group_names", names)
+        end
+    end
+    return nil
+end
+
+-- ---------------------------------------------------------------------------
+
+--- The objects of one kind a library is missing, fetched in batches and
+-- stored. @return error or nil
+local function fetch_objects(jobs, report)
+    -- in chunks, so that a large first download is never all in memory at once
+    local CHUNK = 8
+    local total = #jobs
+    for start = 1, total, CHUNK do
+        local chunk, urls = {}, {}
+        for i = start, math.min(start + CHUNK - 1, total) do
+            chunk[#chunk + 1] = jobs[i]
+            urls[#urls + 1] = jobs[i].url
+        end
+        if not report(jobs[start], start) then return API.CANCELLED end
+        local answers = API.getMany(urls)
+        for i, job in ipairs(chunk) do
+            local a = answers[i]
+            if not a.value then return a.err or "Error: no answer" end
+            if type(a.value) ~= "table" then return "Error: unexpected answer from Zotero" end
+            seen_version(job.ctx, lmv(a.headers))
+            local serr
+            if job.kind == "collections" then
+                serr = store_collections(job.ctx, a.value)
+            else
+                serr = store_items(job.ctx, a.value)
+            end
+            if serr then return "Error: could not store items: " .. serr end
+            -- (every stored batch is a point where the sync may stop)
+            if not report(jobs[start + i] or job, start + i) then return API.CANCELLED end
+        end
+        Bg.pause()
+    end
+    return nil
+end
+
+--- The old way, for a library whose version list cannot be trusted: every
+-- changed object, page by page. @return error or nil
+local function fetch_paged(ctx, kind, since, report)
+    local base = API.libraryURL(ctx.lib)
+    local url = kind == "collections" and (base .. "/collections?since=" .. since .. "&format=json")
+        or (base .. "/items?since=" .. since .. "&format=json&includeTrashed=1")
+    local label = kind == "collections" and "Syncing collections %.0f%%" or "Syncing items %.0f%%"
+    local page_error
+    local ok, version, err = pcall(API.fetchCollectionPaginated, url, API.zoteroHeader, function(entries, pct)
+        if report(string.format(label, pct)) == false then return false end
+        if page_error then return end
+        page_error = kind == "collections" and store_collections(ctx, entries) or store_items(ctx, entries)
+    end)
+    if not ok then return "Error: " .. tostring(version) end
+    if err then return err end
+    if page_error then return "Error: could not store items: " .. page_error end
+    seen_version(ctx, version)
+    return nil
+end
+
+--- Download what changed in the Zotero libraries since the last sync.
+-- @return nil on success, or an error message
+function API.pull(progress_callback)
+    local callback = progress_callback or function() end
+    local stopped = false
+    local function go(msg, fraction)
+        if stopped then return false end
+        if callback(msg, fraction) == false then stopped = true; return false end
+        return true
+    end
+    local e = API.verifyZoteroAccess(); if e then return e end
+    if not go("Asking Zotero what changed…") then return API.CANCELLED end
+    local db = API.openDB()
+    local settings = API.getSettings()
+    local positions = not settings or settings:readSetting("sync_reading_position") ~= false
+    local settings_since = tonumber(db:rowexec("SELECT version FROM syncSettings WHERE name='#version'")) or 0
+    local groups = API.groupsWanted()
+
+    -- 1. one round: which libraries changed, the groups, the positions
+    local urls, slots = {}, {}
+    local function ask(url, slot) urls[#urls + 1] = url; slots[#slots + 1] = slot end
+    local function ask_all(lib)
+        ask(API.libraryURL(lib) .. "/items?since=" .. string.format("%d", lib.version) .. "&format=versions&includeTrashed=1", { lib = lib, what = "all" })
+    end
+    for __, lib in ipairs(API.libraries()) do
+        if lib.type ~= "group" or groups then ask_all(lib) end
+    end
+    if groups then ask(API.libraryURL() .. "/groups?format=versions", { what = "groups" }) end
+    if positions then ask(API.libraryURL() .. "/settings?since=" .. string.format("%d", settings_since), { what = "settings" }) end
+    local answers = API.getMany(urls)
+    if stopped or Bg.stopped() then return API.CANCELLED end
+
+    local libs = {}  -- the libraries to download into, in order
+    local by_lib = {}
+    local function entry(lib)
+        if not by_lib[lib.id] then
+            by_lib[lib.id] = { ctx = new_ctx(lib) }
+            libs[#libs + 1] = lib
+        end
+        return by_lib[lib.id]
+    end
+    -- (the groups first: a group that is gone answers with an error)
+    local order = {}
+    for i, slot in ipairs(slots) do order[#order + 1] = { i = i, first = slot.what ~= "all" and 0 or 1 } end
+    table.sort(order, function(a, b) if a.first ~= b.first then return a.first < b.first end return a.i < b.i end)
+    for __, o in ipairs(order) do
+        local i, slot = o.i, slots[o.i]
+        local a = answers[i]
+        if slot.what == "all" then
+            local lib = API.library(slot.lib.id)
+            if lib and lib.id == slot.lib.id then
+                if a.value then
+                    local x = entry(slot.lib)
+                    x.all, x.all_headers = a.value, a.headers
+                elseif lib.type == "group" and (a.code == 403 or a.code == 404) then
+                    -- a group this key cannot read (any more): left as it is
+                    logger.warn("Zotero: group library", lib.groupID, "cannot be read:", tostring(a.err))
+                else
+                    return a.err
+                end
+            end
+        elseif slot.what == "groups" then
+            if a.value and type(a.value) == "table" then
+                local gerr = update_groups(a.value)
+                if gerr then logger.warn("Zotero: group libraries not updated:", tostring(gerr)) end
+            else
+                logger.warn("Zotero: groups not listed:", tostring(a.err))
+            end
+        elseif slot.what == "settings" then
+            local sok, serr = pcall(API.storeSettings, a.value, a.headers)
+            if not sok or (a.err and not a.value) then
+                logger.warn("Zotero: reading positions not downloaded:", tostring(a.err or serr))
+            end
+        end
+    end
+    -- the user's library, then groups added just now
+    if groups then
+        local fresh = {}
+        for __, lib in ipairs(API.groupLibraries()) do
+            if not by_lib[lib.id] then fresh[#fresh + 1] = lib end
+        end
+        if #fresh > 0 then
+            local more = {}
+            for i, lib in ipairs(fresh) do
+                more[i] = API.libraryURL(lib) .. "/items?since=0&format=versions&includeTrashed=1"
+            end
+            local more_answers = API.getMany(more)
+            for i, lib in ipairs(fresh) do
+                local a = more_answers[i]
+                if not a.value then return a.err end
+                local x = entry(lib)
+                x.all, x.all_headers = a.value, a.headers
+            end
+        end
+    end
+    -- (the libraries' records again: a group's name may have changed)
+    for __, lib in ipairs(libs) do
+        local now = API.library(lib.id)
+        if now and now ~= lib then by_lib[lib.id].ctx.lib = now end
+    end
+
+    -- 2. for the libraries that changed: collections, the items not in the
+    -- trash, deletions
+    local changed = {}
+    for __, lib in ipairs(libs) do
+        local x = by_lib[lib.id]
+        local v = lmv(x.all_headers)
+        if lib.version == 0 or v == nil or v ~= lib.version or next(x.all) ~= nil then
+            changed[#changed + 1] = lib
+        else
+            seen_version(x.ctx, v)
+            x.unchanged = true
+        end
+    end
+    if #changed > 0 then
+        local urls2, slots2 = {}, {}
+        for __, lib in ipairs(changed) do
+            local base, since = API.libraryURL(lib), string.format("%d", lib.version)
+            urls2[#urls2 + 1] = base .. "/collections?since=" .. since .. "&format=versions"; slots2[#slots2 + 1] = { lib = lib, what = "collections" }
+            urls2[#urls2 + 1] = base .. "/items?since=" .. since .. "&format=versions"; slots2[#slots2 + 1] = { lib = lib, what = "live" }
+            urls2[#urls2 + 1] = base .. "/deleted?since=" .. since; slots2[#slots2 + 1] = { lib = lib, what = "deleted" }
+        end
+        if not go("Asking Zotero what changed…") then return API.CANCELLED end
+        local answers2 = API.getMany(urls2)
+        if stopped or Bg.stopped() then return API.CANCELLED end
+        for i, slot in ipairs(slots2) do
+            local a = answers2[i]
+            if not a.value then return a.err end
+            local x = by_lib[slot.lib.id]
+            x[slot.what], x[slot.what .. "_headers"] = a.value, a.headers
+        end
+    end
+
+    -- 3. what is missing here, in batches, for all libraries together
+    local jobs = {}
+    local comparing = false
+    for __, lib in ipairs(changed) do
+        local x = by_lib[lib.id]
+        local ctx = x.ctx
+        local base = API.libraryURL(lib)
+        for __, h in ipairs({ x.all_headers, x.collections_headers, x.live_headers, x.deleted_headers }) do seen_version(ctx, lmv(h)) end
+        -- collections
+        if complete(x.collections, x.collections_headers) then
+            local have = local_versions(lib, "collections")
+            local wanted = {}
+            for key, version in pairs(x.collections) do
+                if have[key] ~= tonumber(version) then wanted[#wanted + 1] = key end
+            end
+            table.sort(wanted)
+            for start = 1, #wanted, BATCH do
+                local keys = {}
+                for j = start, math.min(start + BATCH - 1, #wanted) do keys[#keys + 1] = wanted[j] end
+                jobs[#jobs + 1] = { ctx = ctx, kind = "collections", label = "Syncing collections…",
+                    url = base .. "/collections?format=json&collectionKey=" .. table.concat(keys, ",") }
+            end
+        else
+            x.paged_collections = true
+        end
+        -- items
+        if complete(x.all, x.all_headers) and complete(x.live, x.live_headers) and count_keys(x.all) >= count_keys(x.live) then
+            local have = local_versions(lib, "items")
+            if lib.version == 0 and next(have) ~= nil then
+                -- already stored here (after an update of the plugin, or
+                -- "Resync"): compared, not downloaded again
+                ctx.compared = true
+                comparing = true
+            end
+            local wanted = {}
+            for key, version in pairs(x.live) do
+                if Util.isValidKey(key) and have[key] ~= tonumber(version) then wanted[#wanted + 1] = key end
+            end
+            table.sort(wanted)
+            x.trashed = {}
+            for key in pairs(x.all) do if x.live[key] == nil then x.trashed[#x.trashed + 1] = key end end
+            if ctx.compared then
+                x.gone = {}
+                for key in pairs(have) do if x.all[key] == nil then x.gone[#x.gone + 1] = key end end
+            end
+            logger.info("Zotero: library", lib.id, lib.name, ":", count_keys(x.live), "changed items listed,", #wanted, "to fetch,", #x.trashed, "in the trash")
+            for start = 1, #wanted, BATCH do
+                local keys = {}
+                for j = start, math.min(start + BATCH - 1, #wanted) do keys[#keys + 1] = wanted[j] end
+                jobs[#jobs + 1] = { ctx = ctx, kind = "items", label = "Syncing items %.0f%%", n = #keys,
+                    url = base .. "/items?format=json&includeTrashed=1&itemKey=" .. table.concat(keys, ",") }
+            end
+        else
+            logger.warn("Zotero: the server's item list for library", lib.id, "looks incomplete; downloading page by page instead")
+            x.paged_items = true
+        end
+    end
+    if comparing and not go("Comparing with the Zotero library…") then return API.CANCELLED end
+    -- collections first: items are placed in them
+    table.sort(jobs, function(a, b)
+        if a.kind ~= b.kind then return a.kind == "collections" end
+        return false
+    end)
+    local total_items = 0
+    for __, j in ipairs(jobs) do if j.kind == "items" then total_items = total_items + j.n end end
+    local ferr = fetch_objects(jobs, function(job, index)
+        local label = job.label
+        local fraction
+        if job.kind == "items" then
+            local n = 0
+            for k = 1, index - 1 do if jobs[k].kind == "items" then n = n + jobs[k].n end end
+            fraction = total_items > 0 and n / total_items or 1
+            label = string.format(label, 100 * fraction)
+        end
+        return go(label, fraction)
+    end)
+    if ferr then return ferr end
+    for __, lib in ipairs(changed) do
+        local x = by_lib[lib.id]
+        if x.paged_collections then
+            local perr = fetch_paged(x.ctx, "collections", lib.version, go)
+            if perr then return perr end
+        end
+        if x.paged_items then
+            local perr = fetch_paged(x.ctx, "items", lib.version, go)
+            if perr then return perr end
+        end
+    end
+    if stopped or Bg.stopped() then return API.CANCELLED end
+
+    -- 4. deletions and the index, per library; then its version
+    if #changed > 0 then go("Updating local index…") end
+    local first_time = false
+    for __, lib in ipairs(changed) do if lib.version == 0 then first_time = true end end
+    for __, lib in ipairs(libs) do
+        local x = by_lib[lib.id]
+        if not x.unchanged then
+            local ierr = finish_library(x.ctx, x.deleted, x.trashed, x.gone)
+            if ierr then return ierr end
+        end
+        local version = x.ctx.lowest or lib.version
+        if version < lib.version then version = lib.version end
+        if version ~= lib.version or not x.unchanged then set_library_version(x.ctx.lib, version) end
+        Bg.pause()
+    end
+    API.forgetLibraries()
     if API.restored_seen then
-        API.restored_seen=nil
+        API.restored_seen = nil
         pcall(API.scanStorage) -- which of the restored attachments have their file here
     end
-    return lowest or since,nil
+    if first_time then pcall(API.scanStorage) end
+    logger.info("Zotero: libraries synced:", #libs, "(", #changed, "changed)")
+    return nil
+end
+API.setLibraryVersion = set_library_version
+
+--- Kept for compatibility: the user's library only, through API.pull.
+function API.fetchZoteroItems()
+    local err = API.pull()
+    if err then return nil, err end
+    return API.getUserLibraryVersion(), nil
 end
 
 --- Rebuild the whole local index from the stored items. Not part of a normal
@@ -1290,26 +1984,145 @@ end
 local function is_child(d)
     return type(d.parentItem)=="string" and d.parentItem~=""
 end
-function API.displayCollection(key)
+
+-- ---------------------------------------------------------------------------
+-- The browser's lists, and their order
+-- ---------------------------------------------------------------------------
+
+local SORTS = { added = true, modified = true, author = true, title = true }
+--- How entries are ordered: { by = "added" | "modified" | "author" | "title", desc = bool }
+-- (default: date added, newest first)
+function API.getSort()
+    local s = API.settings and API.settings:readSetting("browser_sort")
+    if type(s) ~= "table" or not SORTS[s.by] then return { by = "added", desc = true } end
+    return { by = s.by, desc = s.desc and true or false }
+end
+function API.setSort(by, desc)
+    if not SORTS[by] then return end
+    API.settings:saveSetting("browser_sort", { by = by, desc = desc and true or false })
+end
+
+--- A name for sorting: lower case, without accents.
+local function fold(s)
+    s = Dav.nfd(tostring(s or "")):gsub("\204[\128-\191]", ""):gsub("\205[\128-\175]", "")
+    s = s:gsub("^[%s%p]+", "")
+    return string.lower(s)
+end
+API._fold = fold
+
+local function first_creator(d, meta)
+    if type(meta) == "table" and type(meta.creatorSummary) == "string" and meta.creatorSummary ~= "" then
+        return meta.creatorSummary
+    end
+    for __, c in ipairs(type(d.creators) == "table" and d.creators or {}) do
+        local name = c.lastName or c.name
+        if type(name) == "string" and name ~= "" then return name end
+    end
+    return nil
+end
+
+--- An entry of a list, from an item as stored.
+local function entry_of(key, item, type_name)
+    local d = item and item.data or {}
+    local meta = item and item.meta or {}
+    local title = d.title or d.filename or key
+    local creator = first_creator(d, meta)
+    local text = title
+    if type(meta.creatorSummary) == "string" and meta.creatorSummary ~= "" then text = meta.creatorSummary .. " - " .. title end
+    return {
+        key = key, text = text, type = type_name == "attachment" and "attachment" or "item",
+        is_pdf = d.contentType == "application/pdf",
+        added = type(d.dateAdded) == "string" and d.dateAdded or "",
+        modified = type(d.dateModified) == "string" and d.dateModified or "",
+        author = creator and fold(creator) or nil,
+        year = type(meta.parsedDate) == "string" and meta.parsedDate:sub(1, 4) or "",
+        title_key = fold(title),
+    }
+end
+
+--- Put entries in the order chosen (sort = API.getSort() if not given).
+-- Entries that lack what is sorted by (no author, say) come last.
+function API.sortEntries(entries, sort)
+    sort = sort or API.getSort()
+    local by, desc = sort.by, sort.desc
+    local function value(e)
+        if by == "added" then return e.added ~= "" and e.added or nil end
+        if by == "modified" then return e.modified ~= "" and e.modified or nil end
+        if by == "author" then return e.author and (e.author .. "\0" .. (e.year or "")) or nil end
+        return e.title_key ~= "" and e.title_key or nil
+    end
+    for _, e in ipairs(entries) do e._v = value(e) end
+    table.sort(entries, function(a, b)
+        local va, vb = a._v, b._v
+        if va ~= vb then
+            if va == nil then return false end
+            if vb == nil then return true end
+            if desc then return va > vb end
+            return va < vb
+        end
+        if a.title_key ~= b.title_key then return (a.title_key or "") < (b.title_key or "") end
+        return a.key < b.key
+    end)
+    for _, e in ipairs(entries) do e._v = nil end
+    return entries
+end
+
+--- A collection's subcollections (by name) and entries (in the order chosen).
+-- @param key the collection; nil: the top of the user's library; "/g<id>":
+--        the top of a group library
+function API.displayCollection(key, sort)
     key=key or "/"; local db=API.openDB(); local out={}
     local cid=tonumber(db:rowexec("SELECT collectionID FROM collections WHERE key='"..key:gsub("'","''").."'")); if not cid then return out end
-    local st=db:prepare("SELECT key,collectionName,synced FROM collections WHERE parentCollectionID=? ORDER BY collectionName COLLATE NOCASE"); local row=st:bind(cid):step()
+    local st=db:prepare("SELECT key,collectionName,synced FROM collections WHERE parentCollectionID=?"); local row=st:bind(cid):step()
     -- (offline: a collection whose files a sync downloads)
-    while row do table.insert(out,{key=row[1],text=row[2] or "",type="collection",offline=(tonumber(row[3]) or 0)>0}); row=st:step(row) end; st:close()
+    while row do table.insert(out,{key=row[1],text=row[2] or "",type="collection",offline=(tonumber(row[3]) or 0)>0,name_key=fold(row[2])}); row=st:step(row) end; st:close()
+    table.sort(out,function(a,b) if a.name_key~=b.name_key then return a.name_key<b.name_key end return a.key<b.key end)
     st=db:prepare([[SELECT i.key,d.value,t.typeName FROM collectionItems ci JOIN items i ON i.itemID=ci.itemID JOIN itemData d ON d.itemID=i.itemID JOIN itemTypes t ON t.itemTypeID=i.itemTypeID WHERE ci.collectionID=? AND t.typeName NOT IN ('annotation')]])
     row=st:bind(cid):step()
+    local entries={}
     while row do
-        local item=safe_decode(row[2]); local d=item and item.data or {}; local meta=item and item.meta or {}; local text=d.title or d.filename or row[1]; if meta.creatorSummary and meta.creatorSummary~="" then text=meta.creatorSummary.." - "..text end
+        local item=safe_decode(row[2]); local d=item and item.data or {}
         -- (the files, links and notes of an entry belong to no collection of
         -- their own and are stored under the top level: they are reached
         -- through their entry, not listed beside it)
-        local tp=row[3]=="attachment" and "attachment" or "item"; if not is_child(d) then table.insert(out,{key=row[1],text=text,type=tp,is_pdf=d.contentType=="application/pdf"}) end; row=st:step(row)
+        if not is_child(d) then entries[#entries+1]=entry_of(row[1],item,row[3]) end
+        row=st:step(row)
     end
-    st:close(); return out
+    st:close()
+    API.sortEntries(entries,sort)
+    for __,e in ipairs(entries) do out[#out+1]=e end
+    return out
 end
-function API.displaySearchResults(query)
-    query=string.lower(query or ""); local db=API.openDB(); local out={}; local st=db:prepare([[SELECT i.key,d.value,t.typeName FROM items i JOIN itemData d USING(itemID) JOIN itemTypes t USING(itemTypeID) WHERE t.typeName NOT IN ('annotation')]])
-    local row=st:reset():step(); while row do local item=safe_decode(row[2]); local d=item and item.data or {}; local meta=item and item.meta or {}; local text=d.title or d.filename or row[1]; if meta.creatorSummary and meta.creatorSummary~="" then text=meta.creatorSummary.." - "..text end; if (query=="" or string.lower(text):find(query,1,true)) and not is_child(d) then table.insert(out,{key=row[1],text=text,type=row[3]=="attachment" and "attachment" or "item"}) end; row=st:step(row) end; st:close(); table.sort(out,function(a, b) return a.text<b.text end); return out
+--- The group libraries, as entries of the browser's top level.
+function API.displayLibraries()
+    local out={}
+    for __,lib in ipairs(API.groupLibraries()) do
+        out[#out+1]={key=lib.root,text=lib.name,type="library",library=lib.id,groupID=lib.groupID}
+    end
+    return out
+end
+--- Entries whose title or first author contains the query ("": all), in the
+-- order chosen. @param lid only those of this library (nil: all libraries)
+function API.displaySearchResults(query, lid, sort)
+    query=string.lower(query or ""); local db=API.openDB(); local out={}
+    local st
+    if lid then
+        st=db:prepare([[SELECT i.key,d.value,t.typeName FROM items i JOIN itemData d USING(itemID) JOIN itemTypes t USING(itemTypeID) WHERE t.typeName NOT IN ('annotation') AND i.libraryID=?]])
+        st:bind(tonumber(lid))
+    else
+        st=db:prepare([[SELECT i.key,d.value,t.typeName FROM items i JOIN itemData d USING(itemID) JOIN itemTypes t USING(itemTypeID) WHERE t.typeName NOT IN ('annotation')]])
+    end
+    local row=st:step()
+    while row do
+        local item=safe_decode(row[2]); local d=item and item.data or {}
+        if not is_child(d) then
+            local e=entry_of(row[1],item,row[3])
+            if query=="" or string.lower(e.text):find(query,1,true) then out[#out+1]=e end
+        end
+        row=st:step(row)
+    end
+    st:close()
+    return API.sortEntries(out,sort)
 end
 
 function API.getAttachmentVersion(key)
@@ -1368,18 +2181,6 @@ local function extract_zip(zip, dir)
 end
 API._extractZip=extract_zip
 
-function API.downloadWebDAV(key, targetDir, targetPath)
-    local base=API.getWebDAVUrl(); if base=="" then return nil,"WebDAV url not set" end
-    mkdir_p(targetDir); local zip=BaseUtil.joinPath(targetDir,key..".zip"); local f=io.open(zip,"wb"); if not f then return nil,"Could not create WebDAV zip" end
-    if socketutil then socketutil:set_timeout(30,-1) end
-    local ok,r,c=pcall(https.request,{method="GET",url=base:gsub("/$","").."/"..key..".zip",headers=API.getWebDAVHeaders(),sink=ltn12.sink.file(f)})
-    if socketutil then socketutil:reset_timeout() end
-    local e=(not ok) and ("Error: "..tostring(r)) or API.verifyResponse(r,c); if e then os.remove(zip); return nil,e end
-    ok=extract_zip(zip,targetDir)
-    os.remove(zip); if not ok then return nil,"Unzipping failed" end
-    if file_exists(targetPath) then return targetPath end
-    return API.findFileByBasename(targetDir,API.basenameOfPath(targetPath)) or targetPath
-end
 --- Remember that this attachment's file is on this device (annotation sync
 -- only looks at those).
 function API.markAttachmentPresent(key)
@@ -1449,73 +2250,381 @@ local function prepare_snapshot(path)
     if not ok then logger.warn("Zotero: snapshot not prepared:", tostring(path), tostring(err)) end
 end
 
-function API.downloadAndGetPath(key, download_callback)
+-- ---------------------------------------------------------------------------
+-- What this device knows about an attachment (table attachmentState)
+-- ---------------------------------------------------------------------------
+
+local STATE_FIELDS = { "info", "annLocal", "annRemote", "failVersion", "failCode", "failAt" }
+function API.attachmentState(key)
+    local st = API.openDB():prepare("SELECT info,annLocal,annRemote,failVersion,failCode,failAt FROM attachmentState WHERE key=?")
+    local row = st:bind(key):step()
+    local out = {}
+    if row then for i, f in ipairs(STATE_FIELDS) do out[f] = row[i] end end
+    st:close()
+    out.failVersion, out.failCode, out.failAt = tonumber(out.failVersion) or 0, tonumber(out.failCode) or 0, tonumber(out.failAt) or 0
+    return out
+end
+--- Change some of an attachment's state; a field set to false is cleared.
+function API.setAttachmentState(key, fields)
+    local cur = API.attachmentState(key)
+    for k, v in pairs(fields) do
+        if v == false then cur[k] = (k == "failVersion" or k == "failCode" or k == "failAt") and 0 or nil else cur[k] = v end
+    end
+    local st = API.openDB():prepare([[INSERT INTO attachmentState(key,info,annLocal,annRemote,failVersion,failCode,failAt) VALUES(?,?,?,?,?,?,?)
+        ON CONFLICT(key) DO UPDATE SET info=excluded.info,annLocal=excluded.annLocal,annRemote=excluded.annRemote,failVersion=excluded.failVersion,failCode=excluded.failCode,failAt=excluded.failAt]])
+    st:bind(key, cur.info, cur.annLocal, cur.annRemote, cur.failVersion or 0, cur.failCode or 0, cur.failAt or 0):step()
+    st:close()
+end
+--- Forget what the annotation sync noted about every attachment (the next
+-- sync looks at every document again).
+function API.forgetAnnotationState()
+    API.openDB():exec("UPDATE attachmentState SET annLocal=NULL,annRemote=NULL")
+end
+--- Forget download failures (the next sync tries those files again).
+function API.forgetDownloadFailures()
+    API.openDB():exec("UPDATE attachmentState SET failVersion=0,failCode=0,failAt=0")
+end
+
+-- ---------------------------------------------------------------------------
+-- Downloading files
+--
+-- A file is downloaded next to its place and renamed when complete, so that
+-- an interrupted download never leaves a truncated file that looks valid. In
+-- a background job the transfer runs in a child process (the reader stays
+-- usable); the job only watches the file grow.
+--
+-- Where a file comes from:
+--   the user's library  Zotero's storage (the API answers with a redirect to
+--                       the file, which is fetched without the API key), or
+--                       the user's WebDAV storage (<KEY>.zip), as configured
+--   a group library     Zotero's storage; or, for a group whose files are in
+--                       a shared WebDAV folder (Group Linked Files), that
+--                       folder, falling back to Zotero's storage for a file
+--                       the folder does not have
+-- ---------------------------------------------------------------------------
+
+--- How a group's files are reached: { mode = "zotero" | "webdav", server, path, user, password }
+function API.groupFiles(gid)
+    local t = API.settings:readSetting("group_files")
+    local cfg = type(t) == "table" and t[tostring(gid)] or nil
+    if type(cfg) ~= "table" then return { mode = "zotero" } end
+    return cfg
+end
+function API.setGroupFiles(gid, cfg)
+    local t = API.settings:readSetting("group_files")
+    if type(t) ~= "table" then t = {} end
+    t[tostring(gid)] = cfg
+    API.settings:saveSetting("group_files", t)
+    API.dav_listings = nil
+end
+
+--- The files in a group's shared WebDAV folder (reused for a minute).
+-- @return { { name, isDir, size } } or nil, error
+function API.davListing(cfg, fresh)
+    local url = Dav.folderURL(cfg)
+    if not url then return nil, "the WebDAV address is not set" end
+    API.dav_listings = API.dav_listings or {}
+    local hit = API.dav_listings[url]
+    if not fresh and hit and os.time() - hit.at < Dav.LIST_TTL then return hit.entries end
+    local res = API.requestMany({ {
+        method = "PROPFIND", url = url, body = Dav.PROPFIND_BODY,
+        headers = { Authorization = Dav.authHeader(cfg, sha2.bin_to_base64), Depth = "1", ["content-type"] = "application/xml; charset=utf-8" },
+    } }, 1)[1]
+    if res.err then return nil, "WebDAV: " .. tostring(res.err) end
+    if res.code == 401 or res.code == 403 then return nil, "WebDAV: the login was refused (user name, WebDAV password)" end
+    if res.code == 404 then return nil, "WebDAV: the folder was not found" end
+    if res.code ~= 207 then return nil, "WebDAV answered with status " .. tostring(res.code) end
+    local entries = Dav.parseMultistatus(res.body, url)
+    API.dav_listings[url] = { at = os.time(), entries = entries }
+    return entries
+end
+
+--- Check a group's WebDAV folder. @return number of files, number of folders  or nil, error
+function API.checkGroupDav(cfg)
+    local entries, err = API.davListing(cfg, true)
+    if not entries then return nil, err end
+    local files, folders = 0, 0
+    for __, e in ipairs(entries) do if e.isDir then folders = folders + 1 else files = files + 1 end end
+    return files, folders
+end
+
+--- Fetch a file into `part`, trying the sources in order; a source that
+-- answers 404 passes on to the next. Redirects are followed by hand, without
+-- the headers of the first request (the API key stays with Zotero).
+-- Runs in a child process: plain data in, plain data out.
+-- @return { code =, source = } or { err = }
+local function fetch_file(sources, part)
+    local last = { err = "no source" }
+    for __, src in ipairs(sources) do
+        local url, headers = src.url, src.headers
+        local res
+        for __ = 1, 4 do
+            res = API.exchange{ method = "GET", url = url, headers = headers, file = part, redirect = false, block_timeout = 30, total_timeout = -1 }
+            if res.err or not (res.code >= 300 and res.code < 400 and res.headers.location) then break end
+            local loc = res.headers.location
+            if not loc:match("^%a[%w+.-]*://") then
+                loc = url:match("^(%a[%w+.-]*://[^/]+)") .. (loc:sub(1, 1) == "/" and "" or "/") .. loc
+            end
+            url, headers = loc, src.redirect_headers or {}
+        end
+        if res.err then return { err = res.err, source = src.name } end
+        last = { code = res.code, source = src.name }
+        if res.code ~= 404 then return last end
+    end
+    return last
+end
+API._fetchFile = fetch_file
+
+-- downloads running now: key -> true (one at a time for each file)
+local downloading = {}
+
+--- Everything needed to download an attachment's file.
+-- @return d = { key, item, kind, dir, path, part, sources, total }, or nil and an error
+local function prepare_download(item)
+    local key, d = item.key, item.data
+    local kind = API.attachmentKind(d)
+    if not kind then return nil, API.whyNotOpenable(d) end
+    if d.linkMode == "linked_file" then return nil, "Linked file not found locally" end
+    local e = API.verifyZoteroAccess(); if e then return nil, e end
+    local lib = API.libraryOfKey(key)
+    local dir, path = API.getDirAndPath(item)
+    local dl = { key = key, item = item, kind = kind, dir = dir, path = path, part = path .. ".part",
+        total = tonumber(item.fileLength), sources = {} }
+    local zotero = { name = "zotero", url = API.libraryURL(lib) .. "/items/" .. key .. "/file", headers = API.zoteroHeader }
+    if lib.type == "group" then
+        local cfg = API.groupFiles(lib.groupID)
+        if cfg.mode == "webdav" and Dav.usable(cfg) then
+            local name = d.filename or API.basenameOfPath(path)
+            local entries, lerr = API.davListing(cfg)
+            local hit = entries and Dav.find(entries, name)
+            if entries and not hit then
+                -- (refreshed once: the file may have been added since)
+                entries = API.davListing(cfg, true)
+                hit = entries and Dav.find(entries, name)
+            end
+            if hit or not entries then
+                if lerr then logger.warn("Zotero: WebDAV folder of group", lib.groupID, "not listed:", tostring(lerr)) end
+                local auth = { Authorization = Dav.authHeader(cfg, sha2.bin_to_base64) }
+                table.insert(dl.sources, { name = "webdav", url = Dav.folderURL(cfg) .. Dav.encode(hit and hit.name or name), headers = auth, redirect_headers = auth })
+                if hit and hit.size then dl.total = hit.size end
+                dl.dav_error = lerr
+            end
+        end
+        table.insert(dl.sources, zotero)
+    elseif API.getWebDAVEnabled() then
+        local base = API.getWebDAVUrl()
+        if base == "" then return nil, "WebDAV url not set" end
+        local auth = API.getWebDAVHeaders()
+        dl.zipped = true
+        dl.part = BaseUtil.joinPath(dir, key .. ".zip")
+        table.insert(dl.sources, { name = "webdav", url = base:gsub("/$", "") .. "/" .. key .. ".zip", headers = auth, redirect_headers = auth })
+    else
+        table.insert(dl.sources, zotero)
+    end
+    return dl
+end
+
+local function info_signature(item, path)
+    local parent = item.data.parentItem and API.getItemVersion(item.data.parentItem) or 0
+    return string.format("%d:%d:%d", tonumber(item.version) or 0, tonumber(parent) or 0, tonumber(lfs.attributes(path, "size")) or 0)
+end
+
+--- A file that is here: note it in the document (title, authors), prepare a
+-- snapshot - only when something changed since the last time.
+local function note_present(item, path, kind)
+    local sig = info_signature(item, path)
+    local state = API.attachmentState(item.key)
+    if state.info == sig then return end
+    if kind == "html" then prepare_snapshot(path) end
+    API.getAttachmentInfo(item, path)
+    API.markAttachmentPresent(item.key)
+    API.setAttachmentState(item.key, { info = info_signature(item, path), failVersion = false, failCode = false, failAt = false })
+end
+
+--- The downloaded file in its place. @return path, or nil and an error
+local function complete_download(dl, res)
+    local key, item = dl.key, dl.item
+    if res.err or res.code ~= 200 then
+        os.remove(dl.part)
+        local err = res.err and ("Error: " .. tostring(res.err)) or ("Error: API responded with status code " .. tostring(res.code))
+        if res.code == 404 then
+            -- no source has it: not asked for again until the attachment changes
+            API.setAttachmentState(key, { failVersion = tonumber(item.version) or 0, failCode = 404, failAt = os.time() })
+            if dl.dav_error then err = err .. " (" .. tostring(dl.dav_error) .. ")" end
+        end
+        return nil, err
+    end
+    local path = dl.path
+    if dl.zipped then
+        local ok = extract_zip(dl.part, dl.dir)
+        os.remove(dl.part)
+        if not ok then return nil, "Unzipping failed" end
+        if not file_exists(path) then path = API.findFileByBasename(dl.dir, API.basenameOfPath(path)) or path end
+    else
+        -- A web snapshot that consists of several files (older snapshots)
+        -- is stored by Zotero as a zip of its folder.
+        local zipped = false
+        if dl.kind == "html" then
+            local pf = io.open(dl.part, "rb")
+            if pf then zipped = pf:read(4) == "PK\3\4"; pf:close() end
+        end
+        if zipped then
+            local unpacked = extract_zip(dl.part, dl.dir)
+            os.remove(dl.part)
+            if not unpacked then return nil, "Could not unpack the snapshot" end
+            if not file_exists(path) then path = API.findFileByBasename(dl.dir, API.basenameOfPath(path)) or path end
+            if not file_exists(path) then return nil, "The snapshot's main file was not found in what Zotero stores for it" end
+        else
+            os.remove(path)
+            if not os.rename(dl.part, path) then os.remove(dl.part); return nil, "Could not store attachment file" end
+        end
+    end
+    if not file_exists(path) then return nil, "The downloaded file is missing" end
+    if dl.kind == "html" then prepare_snapshot(path) end
+    API.getAttachmentInfo(item, path)
+    API.setAttachmentVersionByKey(key, math.max(1, tonumber(item.version) or 1))
+    API.setAttachmentState(key, { info = info_signature(item, path), failVersion = false, failCode = false, failAt = false })
+    logger.info("Zotero: downloaded", key, "from", tostring(res.source), path)
+    return path, nil
+end
+
+local function wait_for_other_download(key)
+    while downloading[key] do
+        if Bg.current() then Bg.sleep(0.3) else return false end
+        if Bg.stopped() then return false end
+    end
+    return true
+end
+
+--- The file of an attachment, downloaded if it is not here.
+-- @param download_callback called before a download starts
+-- @param opts.progress function(bytes, total or nil) while downloading
+-- @param opts.batch part of a sync: no search by file name outside the
+--        attachment's own places, except in the folder index (beginFileIndex)
+-- @return path, or nil and an error
+function API.downloadAndGetPath(key, download_callback, opts)
+    opts = opts or {}
     local item=API.getItem(key); if not item then return nil,"Error: the requested file can not be found in the database" end
     if not item.data or item.data.itemType~="attachment" then return nil,"Error: this item is not an attachment" end
     local kind=API.attachmentKind(item.data)
     if not kind then return nil,API.whyNotOpenable(item.data) end
-    local local_path=API.resolveAttachmentPath(item)
+    local local_path=API.resolveAttachmentPath(item, true) or API.resolveAttachmentPath(item)
     if local_path and file_exists(local_path) then
-        if kind=="html" then prepare_snapshot(local_path) end
-        API.getAttachmentInfo(item,local_path); API.markAttachmentPresent(key)
+        Bg.critical(note_present, item, local_path, kind)
         return local_path,nil
     end
-    if item.data.linkMode=="linked_file" then return nil,"Linked file not found locally" end
-    local e=API.verifyZoteroAccess(); if e then return nil,e end
-    local dir,path=API.getDirAndPath(item); mkdir_p(dir); if download_callback then download_callback() end
-    if API.getWebDAVEnabled() then local p,err=API.downloadWebDAV(key,dir,path); if not p then return nil,err end; path=p
-    else
-        -- Download next to the target and rename when complete, so that an
-        -- interrupted download never leaves a truncated file that looks valid.
-        local part=path..".part"
-        local f=io.open(part,"wb"); if not f then return nil,"Could not create attachment file" end
-        if socketutil then socketutil:set_timeout(30,-1) end
-        local ok,r,c=pcall(https.request,{url=API.userLibraryURL.."/items/"..key.."/file",headers=API.zoteroHeader,sink=ltn12.sink.file(f)})
-        if socketutil then socketutil:reset_timeout() end
-        local err=(not ok) and ("Error: "..tostring(r)) or API.verifyResponse(r,c)
-        if err then os.remove(part); return nil,err end
-        -- A web snapshot that consists of several files (older snapshots)
-        -- is stored by Zotero as a zip of its folder.
-        local zipped=false
-        if kind=="html" then
-            local pf=io.open(part,"rb")
-            if pf then zipped=pf:read(4)=="PK\3\4"; pf:close() end
-        end
-        if zipped then
-            local unpacked=extract_zip(part,dir)
-            os.remove(part)
-            if not unpacked then return nil,"Could not unpack the snapshot" end
-            if not file_exists(path) then path=API.findFileByBasename(dir,API.basenameOfPath(path)) or path end
-            if not file_exists(path) then return nil,"The snapshot's main file was not found in what Zotero stores for it" end
-        else
-            os.remove(path)
-            if not os.rename(part,path) then os.remove(part); return nil,"Could not store attachment file" end
-        end
-    end
-    if kind=="html" then prepare_snapshot(path) end
-    API.getAttachmentInfo(item,path)
-    API.setAttachmentVersionByKey(key,math.max(1,tonumber(item.version) or 1)); return path,nil
+    if not wait_for_other_download(key) then return nil, API.CANCELLED end
+    local_path=API.resolveAttachmentPath(item, true)
+    if local_path and file_exists(local_path) then return local_path,nil end -- (it came meanwhile)
+    local dl, err = prepare_download(item)
+    if not dl then return nil, err end
+    mkdir_p(dl.dir)
+    if download_callback then download_callback() end
+    downloading[key] = true
+    local ok, res = pcall(function()
+        return Bg.run({ { fn = fetch_file, args = { dl.sources, dl.part, n = 2 },
+            poll = opts.progress and function() opts.progress(lfs.attributes(dl.part, "size") or 0, dl.total) end } }, 1)[1]
+    end)
+    if not ok then downloading[key] = nil; os.remove(dl.part); return nil, tostring(res) end
+    if res.err == "stopped" then downloading[key] = nil; os.remove(dl.part); return nil, API.CANCELLED end
+    local path, cerr = Bg.critical(complete_download, dl, res)
+    downloading[key] = nil
+    return path, cerr
 end
+
+--- Is the file of this attachment being downloaded right now?
+function API.isDownloading(key) return downloading[key] == true end
+
+--- Download the files of the offline collections that are not here yet, two
+-- at a time; files that are here are noted in their documents if anything
+-- changed. A file the server does not have is not asked for again until
+-- the attachment changes (or a day has passed).
+-- @return number of failures, { { filename, error } }, number downloaded
 function API.batchDownload(progress_callback)
-    progress_callback=progress_callback or function() end; local db=API.openDB(); local st=db:prepare([[SELECT i.key,d.value FROM itemAttachments a JOIN items i ON i.itemID=a.itemID JOIN itemData d ON d.itemID=i.itemID WHERE a.parentItemID IN (SELECT ci.itemID FROM collectionItems ci JOIN collections c ON c.collectionID=ci.collectionID WHERE c.synced=1)]])
+    progress_callback=progress_callback or function() end
+    local function report(msg, fraction) return progress_callback(msg, fraction) ~= false end
+    local db=API.openDB(); local st=db:prepare([[SELECT i.key,d.value FROM itemAttachments a JOIN items i ON i.itemID=a.itemID JOIN itemData d ON d.itemID=i.itemID WHERE a.parentItemID IN (SELECT ci.itemID FROM collectionItems ci JOIN collections c ON c.collectionID=ci.collectionID WHERE c.synced=1)]])
     local rows={}; local row=st:reset():step()
     while row do
         -- only what is a file the reader can open: links to web pages are not downloads
         local item=safe_decode(row[2])
-        if item and API.attachmentKind(item.data) then table.insert(rows,{row[1],row[2]}) end
+        if item and API.attachmentKind(item.data) then table.insert(rows,item) end
         row=st:step(row)
     end
-    st:close(); local fails,details=0,{}
-    for i,v in ipairs(rows) do
-        local item=safe_decode(v[2]); local filename=item and item.data and item.data.filename or v[1]
-        if progress_callback(string.format(_("Checking attachment %i/%i"),i,#rows))==false then break end
-        local __, err=API.downloadAndGetPath(v[1])
-        if err then
-            fails=fails+1; table.insert(details,{filename=filename,error=err})
-            logger.warn("Zotero: attachment", v[1], tostring(filename), "not downloaded:", tostring(err))
+    st:close()
+    local fails,details,downloaded=0,{},0
+    local todo={}
+    API.beginFileIndex()
+    local ok,err=pcall(function()
+        for i,item in ipairs(rows) do
+            if (i==1 or i%25==0) and not report(string.format(_("Checking attachment %i/%i"),i,#rows), i/#rows) then return end
+            local path=API.resolveAttachmentPath(item,true) or API.resolveAttachmentPath(item)
+            if path and file_exists(path) then
+                Bg.critical(note_present,item,path,API.attachmentKind(item.data))
+            elseif item.data.linkMode=="linked_file" then
+                fails=fails+1; table.insert(details,{filename=item.data.filename or item.key,error="Linked file not found locally"})
+            elseif not downloading[item.key] then
+                local state=API.attachmentState(item.key)
+                if state.failCode==404 and state.failVersion==(tonumber(item.version) or 0) and os.time()-state.failAt<86400 then
+                    fails=fails+1; table.insert(details,{filename=item.data.filename or item.key,error="not on the server",known=true,key=item.key,code=404})
+                else
+                    todo[#todo+1]=item
+                end
+            end
+            Bg.pause()
         end
+    end)
+    API.endFileIndex()
+    if not ok then error(err) end
+    if #todo==0 then return fails,details,0 end
+    -- the downloads, two at a time
+    local tasks,dls={},{}
+    local bytes,total_known={}, 0
+    for __,item in ipairs(todo) do
+        local dl,perr=prepare_download(item)
+        if dl then
+            mkdir_p(dl.dir)
+            dls[#dls+1]=dl
+        else
+            fails=fails+1; table.insert(details,{filename=item.data.filename or item.key,error=perr})
+        end
+        if Bg.stopped() then break end
     end
-    return fails,details
+    local finished=0
+    local function show()
+        local got=0
+        for i,dl in ipairs(dls) do got=got+(bytes[i] or 0) end
+        report(string.format(_("Downloading %i/%i (%.1f MB)"),math.min(finished+1,#dls),#dls,got/1e6), #dls>0 and finished/#dls or nil)
+    end
+    for i,dl in ipairs(dls) do
+        downloading[dl.key]=true
+        tasks[i]={ fn=fetch_file, args={ dl.sources, dl.part, n=2 },
+            poll=function()
+                bytes[i]=lfs.attributes(dl.part,"size") or bytes[i] or 0
+                show()
+            end,
+            done=function(res)
+                local path,cerr
+                if res.err=="stopped" then
+                    os.remove(dl.part)
+                else
+                    path,cerr=Bg.critical(complete_download,dl,res)
+                end
+                downloading[dl.key]=nil
+                finished=finished+1
+                if path then
+                    downloaded=downloaded+1
+                elseif res.err~="stopped" then
+                    fails=fails+1; table.insert(details,{filename=dl.item.data.filename or dl.key,error=cerr,key=dl.key,code=res.code})
+                    logger.warn("Zotero: attachment", dl.key, tostring(dl.item.data.filename), "not downloaded:", tostring(cerr))
+                end
+                show()
+            end }
+    end
+    show()
+    Bg.run(tasks,2)
+    for __,dl in ipairs(dls) do downloading[dl.key]=nil end
+    return fails,details,downloaded
 end
 
 -- ---------------------------------------------------------------------------
@@ -1554,15 +2663,32 @@ API._encodeObject = encode_object
 
 --- Send up to 50 objects.
 -- @return results (results[i] = { ok = item } | { unchanged = true } | { code, message }), or nil, error
+--- The library objects to be written belong to: that of their parent
+-- (annotations), else their own. All of one request must be in one library.
+local function library_of_objects(objects)
+    local lib
+    for _, obj in ipairs(objects) do
+        local key = type(obj.parentItem) == "string" and obj.parentItem or obj.key
+        local l = API.libraryOfKey(key)
+        if lib and l.id ~= lib.id then return nil end
+        lib = l
+    end
+    return lib or API.library(1)
+end
+
 function API.writeObjects(objects)
     local e = API.verifyZoteroAccess(); if e then return nil, e end
-    if not API.canWrite() then return nil, "this API key may not change the library (read-only key)" end
     if #objects == 0 then return {} end
     if #objects > 50 then return nil, "too many objects in one request" end
+    local lib = library_of_objects(objects)
+    if not lib then return nil, "objects of several libraries in one request" end
+    if not API.canWrite(lib) then
+        return nil, lib.type == "group" and ("this API key may not change the group library " .. lib.name) or "this API key may not change the library (read-only key)"
+    end
     local encoded = {}
     for i, obj in ipairs(objects) do encoded[i] = encode_object(obj) end
     local code, h, raw = API.request{
-        method = "POST", url = API.userLibraryURL .. "/items", headers = API.zoteroHeader,
+        method = "POST", url = API.libraryURL(lib) .. "/items", headers = API.zoteroHeader,
         body = "[" .. table.concat(encoded, ",") .. "]",
     }
     if not code then return nil, "no answer from Zotero (" .. tostring(h) .. ")" end
@@ -1595,7 +2721,7 @@ end
 --- Fetch one item. @return item, or nil and the status code (404 = it does not exist)
 function API.fetchItem(key)
     local e = API.verifyZoteroAccess(); if e then return nil, e end
-    local code, h, raw = API.request{ method = "GET", url = API.userLibraryURL .. "/items/" .. key, headers = API.zoteroHeader }
+    local code, h, raw = API.request{ method = "GET", url = API.libraryURL(API.libraryOfKey(key)) .. "/items/" .. key, headers = API.zoteroHeader }
     if not code then return nil, h end
     if code ~= 200 then return nil, code end
     local item = Util.jsonDecode(raw)
@@ -1610,10 +2736,11 @@ end
 -- @return true, or nil and the status code (412: changed or already gone)
 function API.deleteRemoteItem(key, version)
     local e = API.verifyZoteroAccess(); if e then return nil, e end
-    if not API.canWrite() then return nil, 403 end
+    local lib = API.libraryOfKey(key)
+    if not API.canWrite(lib) then return nil, 403 end
     local headers = copy_table(API.zoteroHeader)
     headers["If-Unmodified-Since-Version"] = string.format("%d", tonumber(version) or 0)
-    local code, h = API.request{ method = "DELETE", url = API.userLibraryURL .. "/items/" .. key, headers = headers }
+    local code, h = API.request{ method = "DELETE", url = API.libraryURL(lib) .. "/items/" .. key, headers = headers }
     if not code then return nil, h end
     if code == 204 then return true end
     return nil, code
@@ -1623,7 +2750,7 @@ end
 function API.storeItem(item)
     if type(item) ~= "table" or not item.key or type(item.data) ~= "table" then return end
     item.links = nil; item.library = nil
-    upsert_item(item)
+    if not upsert_item(item) then return end
     if item.data.itemType == "annotation" and item.data.parentItem then
         API.setAnnotations({ [item.key] = item.data.parentItem })
     end
@@ -1649,6 +2776,17 @@ function API.getAttachmentAnnotations(key)
     end
     st:close()
     return out, others
+end
+
+--- The keys and versions of an attachment's Zotero annotations, as one
+-- string (what changes when any of them changes).
+function API.annotationVersions(key)
+    local st = API.openDB():prepare([[SELECT i.key,i.version FROM itemAnnotations a JOIN items i ON i.itemID=a.itemID WHERE a.parentItemID IN (SELECT itemID FROM items WHERE key=?) ORDER BY i.key]])
+    local parts = {}
+    local row = st:bind(key):step()
+    while row do parts[#parts + 1] = row[1] .. ":" .. tostring(row[2]); row = st:step(row) end
+    st:close()
+    return table.concat(parts, ",")
 end
 
 --- Attachments whose file is on this device: { { key =, item = }, ... }
@@ -1714,57 +2852,22 @@ function API.searchAnnotations(query)
     local row=st:reset():step(); while row do local ann=safe_decode(row[2]); local parent=safe_decode(row[4]); local d=ann and ann.data or {}; local title=parent and parent.data and parent.data.title or ""; local text=d.annotationText or ""; local comment=d.annotationComment or ""; local hay=string.lower(text.." "..comment.." "..title); if (text~="" or comment~="") and (query=="" or hay:find(query,1,true)) then local page=""; local pos=safe_decode(d.annotationPosition); if pos and pos.pageIndex~=nil then page=tostring(pos.pageIndex+1) elseif d.annotationPageLabel then page=tostring(d.annotationPageLabel) end; table.insert(out,{key=row[1],attachmentKey=row[3],parentTitle=title,text=text,comment=comment,page=page,color=d.annotationColor,type=d.annotationType}) end; row=st:step(row) end; st:close(); return out
 end
 
---- Download what changed in the Zotero library since the last sync.
--- @return nil on success, or an error message
-function API.pull(progress_callback)
-    local callback=progress_callback or function() end
-    local e=API.verifyZoteroAccess(); if e then return e end
-    local since=API.getUserLibraryVersion()
-    logger.info("Zotero: syncing from library version", since)
-    logger.info("Zotero: sync stage: collections")
-    callback("Synchronizing collections…")
-    local cv,err=API.fetchZoteroCollections(since,callback); if err then return type(err)=="string" and err or ("Error during collection sync: "..readable_value(err)) end
-    logger.info("Zotero: sync stage: items")
-    callback("Synchronizing items…")
-    local iv; iv,err=API.fetchZoteroItems(since,callback); if err then return type(err)=="string" and err or ("Error during item sync: "..readable_value(err)) end
-    -- The version this copy is complete for is the LOWEST the server
-    -- reported during these requests: anything changed in between is then
-    -- simply fetched again next time.
-    local version=math.min(tonumber(cv) or since,tonumber(iv) or since)
-    if version<since then version=since end
-    API.setUserLibraryVersion(version)
-    if since==0 then pcall(API.scanStorage) end
-    logger.info("Zotero: library is at version", API.getUserLibraryVersion())
-    -- reading positions; a failure here does not undo the library download
-    local settings=API.getSettings()
-    if not settings or settings:readSetting("sync_reading_position")~=false then
-        local sok,serr=pcall(API.fetchSettings)
-        if not sok then logger.warn("Zotero: reading positions not downloaded:", tostring(serr)) end
-    end
-    return nil
-end
-
 -- ---------------------------------------------------------------------------
 -- Reading positions (Zotero's synced setting "lastPageIndex_u_<attachment>")
 -- ---------------------------------------------------------------------------
 
---- Download the reading positions that changed since the last time.
--- @return number of positions stored, or nil and an error
-function API.fetchSettings()
-    local e=API.verifyZoteroAccess(); if e then return nil,e end
+--- Keep the reading positions of an answer to GET <user>/settings?since=…
+-- (also those of group attachments: lastPageIndex_g<group>_<key>).
+-- @return number of positions stored
+function API.storeSettings(result, h)
+    if type(result) ~= "table" then return 0 end
     local db=API.openDB()
-    local since=tonumber(db:rowexec("SELECT version FROM syncSettings WHERE name='#version'")) or 0
-    local result,h=API.getZoteroData(API.userLibraryURL.."/settings?since="..string.format("%d",since))
-    if type(result)~="table" then
-        logger.warn("Zotero: reading positions not downloaded:", tostring(h))
-        return nil,h
-    end
     local n=0
     db:exec("BEGIN")
     local ok,err=pcall(function()
         local st=db:prepare("INSERT INTO syncSettings(name,value,version) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value,version=excluded.version")
         for name,entry in pairs(result) do
-            if type(name)=="string" and name:match("^lastPageIndex_u_[A-Z0-9]+$") and type(entry)=="table" then
+            if type(name)=="string" and (name:match("^lastPageIndex_u_[A-Z0-9]+$") or name:match("^lastPageIndex_g%d+_[A-Z0-9]+$")) and type(entry)=="table" then
                 local t=type(entry.value)
                 if t=="number" or t=="string" then
                     -- kept with its type: a number is a page index, a string an EPUB position
@@ -1773,21 +2876,40 @@ function API.fetchSettings()
                 end
             end
         end
-        local v=tonumber(type(h)=="table" and h["last-modified-version"])
+        local v=lmv(h)
         if v then st:reset():bind("#version","",v):step() end
         st:close()
     end)
     db:exec(ok and "COMMIT" or "ROLLBACK")
-    if not ok then return nil,tostring(err) end
+    if not ok then error(err) end
     if n>0 then logger.info("Zotero: reading positions updated:", n) end
     return n
+end
+
+--- Download the reading positions that changed since the last time.
+-- @return number of positions stored, or nil and an error
+function API.fetchSettings()
+    local e=API.verifyZoteroAccess(); if e then return nil,e end
+    local since=tonumber(API.openDB():rowexec("SELECT version FROM syncSettings WHERE name='#version'")) or 0
+    local result,h=API.getZoteroData(API.libraryURL().."/settings?since="..string.format("%d",since))
+    if type(result)~="table" then
+        logger.warn("Zotero: reading positions not downloaded:", tostring(h))
+        return nil,h
+    end
+    local ok,n=pcall(API.storeSettings,result,h)
+    if not ok then return nil,tostring(n) end
+    return n
+end
+
+local function setting_name(key)
+    return API.libraryOfKey(key).setting_prefix..tostring(key)
 end
 
 --- Where Zotero last read this attachment.
 -- @return value (page index or EPUB position) and its version, or nil
 function API.getRemotePosition(key)
     local st=API.openDB():prepare("SELECT value,version FROM syncSettings WHERE name=?")
-    local row=st:bind("lastPageIndex_u_"..tostring(key)):step()
+    local row=st:bind(setting_name(key)):step()
     local raw,version=row and row[1],row and tonumber(row[2]) or 0
     st:close()
     if type(raw)~="string" or raw=="" then return nil end
@@ -1805,8 +2927,8 @@ end
 -- @return the new version, or nil and the status code (412: Zotero's value changed meanwhile)
 function API.putRemotePosition(key,value,version)
     local e=API.verifyZoteroAccess(); if e then return nil,e end
-    if not API.canWrite() then return nil,403 end
     if not Util.isValidKey(key) then return nil,"invalid key" end
+    if not API.canWrite(key) then return nil,403 end
     local body
     if type(value)=="number" then
         -- an integer, written as one: a decimal would mean a scroll percentage
@@ -1816,8 +2938,9 @@ function API.putRemotePosition(key,value,version)
     else
         return nil,"invalid value"
     end
-    local name="lastPageIndex_u_"..key
-    local code,h=API.request{ method="PUT", url=API.userLibraryURL.."/settings/"..name, headers=API.zoteroHeader, body=body }
+    -- (the positions of group attachments, too, are settings of the user's library)
+    local name=setting_name(key)
+    local code,h=API.request{ method="PUT", url=API.libraryURL().."/settings/"..name, headers=API.zoteroHeader, body=body }
     if not code then return nil,h end
     if code~=204 and code~=200 then return nil,code end
     local new_version=tonumber(type(h)=="table" and h["last-modified-version"]) or tonumber(version) or 0
@@ -1830,49 +2953,80 @@ end
 -- state to merge against), then offline attachments.
 -- @param opts.annotations function(progress) -> summary lines, problem lines
 -- @return an error message when the sync could not be carried out (nil
---         otherwise), and the lines to show the user (what was done; what
---         needs attention)
+--         otherwise), the lines to show the user (what was done, then what
+--         needs attention), and the number of those that need attention
 function API.syncAllItems(progress_callback, opts)
     opts = opts or {}
     -- a progress callback that returns false asks for the sync to stop; it is
     -- honoured between two complete pieces of work, never in the middle of one
     local stopped=false
-    local function callback(msg)
+    local function callback(msg, fraction)
         if stopped then return false end
-        if progress_callback and progress_callback(msg)==false then stopped=true; return false end
+        if progress_callback and progress_callback(msg, fraction)==false then stopped=true; return false end
+        if Bg.stopped() then stopped=true; return false end
         return true
     end
     local function stage(msg)
         logger.info("Zotero: sync stage:", msg)
         return callback(msg)
     end
-    local lines = {}
+    local lines, problems = {}, {}
+    local function result(e)
+        for __,l in ipairs(problems) do lines[#lines+1]=l end
+        return e, lines, #problems
+    end
 
     stage("Checking Zotero access…")
-    local e=API.verifyZoteroAccess(); if e then return type(e)=="string" and e or readable_value(e) end
+    local e=API.verifyZoteroAccess(); if e then return result(type(e)=="string" and e or readable_value(e)) end
 
-    e=API.pull(callback); if e then return e end
-    if stopped then return API.CANCELLED end
+    e=API.pull(callback); if e then return result(e) end
+    if stopped then return result(API.CANCELLED) end
 
     if opts.annotations then
         stage("Synchronizing annotations…")
-        local ok,done,problems=pcall(opts.annotations,callback)
+        local ok,done,trouble=pcall(opts.annotations,callback)
         if not ok then
             logger.err("Zotero: annotation sync failed:", tostring(done))
-            table.insert(lines,"Annotation sync failed: "..tostring(done))
+            table.insert(problems,"Annotation sync failed: "..tostring(done))
         else
             for __,l in ipairs(type(done)=="table" and done or {}) do table.insert(lines,l) end
-            for __,l in ipairs(type(problems)=="table" and problems or {}) do table.insert(lines,l) end
+            for __,l in ipairs(type(trouble)=="table" and trouble or {}) do table.insert(problems,l) end
         end
     end
 
-    if stopped then return API.CANCELLED, lines end
+    if stopped then return result(API.CANCELLED) end
 
     stage("Checking offline attachments…")
-    local df=API.batchDownload(callback); if df>0 then table.insert(lines,"Attachment download errors: "..df) end
-    if stopped then return API.CANCELLED, lines end
+    local df,details,downloaded=API.batchDownload(callback)
+    if (downloaded or 0)>0 then
+        table.insert(lines,string.format(downloaded==1 and "%d file downloaded" or "%d files downloaded",downloaded))
+    end
+    local new,known={},0
+    for __,d in ipairs(details or {}) do
+        if d.known then known=known+1 else new[#new+1]=d end
+    end
+    if #new>0 then
+        table.insert(problems,string.format(#new==1 and "%d file could not be downloaded:" or "%d files could not be downloaded:",#new))
+        for i=1,math.min(5,#new) do table.insert(problems,"· "..tostring(new[i].filename)..": "..tostring(new[i].error)) end
+    end
+    if known>0 then
+        table.insert(lines,string.format("%d file(s) of offline collections are not on the server (tried again when they change)",known))
+    end
+    -- files of a group missing in Zotero's storage: perhaps the group keeps them in a shared folder
+    local hint
+    for __,d in ipairs(details or {}) do
+        if d.code==404 and d.key then
+            local lib=API.libraryOfKey(d.key)
+            if lib.type=="group" and API.groupFiles(lib.groupID).mode~="webdav" then hint=lib.name break end
+        end
+    end
+    if hint then
+        table.insert(#new>0 and problems or lines,string.format("Files of the group \"%s\" are not in Zotero's storage. If the group keeps them in a shared WebDAV folder (Group Linked Files), set it up under Settings > Group libraries.",hint))
+    end
+    if stopped then return result(API.CANCELLED) end
     logger.info("Zotero: sync completed; library version", API.getUserLibraryVersion())
-    return nil, lines
+    if API.settings then API.settings:saveSetting("last_sync_at", os.time()) end
+    return result(nil)
 end
 
 return API

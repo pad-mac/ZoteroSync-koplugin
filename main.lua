@@ -12,6 +12,12 @@ local Screen = Device.screen
 local Font = require("ui/font")
 local Menu = require("ui/widget/menu")
 local Geom = require("ui/geometry")
+local IconButton = require("ui/widget/iconbutton")
+local IconWidget = require("ui/widget/iconwidget")
+local HorizontalGroup = require("ui/widget/horizontalgroup")
+local HorizontalSpan = require("ui/widget/horizontalspan")
+local VerticalGroup = require("ui/widget/verticalgroup")
+local VerticalSpan = require("ui/widget/verticalspan")
 local _ = require("gettext")
 -- KOReader keeps the plugin's folder on the module path only while this file
 -- is being loaded, so every module of the plugin is required here, at the top.
@@ -26,6 +32,9 @@ local Position = require("zotero_position")
 local Icons = require("zotero_icons")
 local Highlight = require("zotero_highlight")
 local Update = require("zotero_update")
+local Bg = require("zotero_bg")
+local Indicator = require("zotero_indicator")
+local Dav = require("zotero_webdav")
 local itemInfoViewer = require("zoteroiteminfo")
 local AnnotationPanel = require("annotation_panel")
 local AnnotationSearch = require("annotation_search")
@@ -40,6 +49,9 @@ local Trapper = require("frontend/ui/trapper")
 local DEFAULT_LINES_PER_PAGE = 14
 
 local init_done = false
+local auto_started = false
+-- (defined further down, with the background syncs)
+local browser_shown, updateIndicator, shortStatusOf
 
 -- KOReader keeps one module per name for all plugins. Another Zotero plugin
 -- (the original zotero.koplugin, or a second copy of this one under another
@@ -51,7 +63,8 @@ for name, mod in pairs({
     zoteroapi = ZoteroAPI, annotations = Annotations, zotero_util = Util, zotero_sync = Sync,
     zotero_doc = Doc, zotero_annsync = AnnotationSync, zotero_colors = Colors, zotero_position = Position, zoteroiteminfo = itemInfoViewer,
     annotation_panel = AnnotationPanel, annotation_search = AnnotationSearch, zotero_icons = Icons,
-    zotero_highlight = Highlight, zotero_update = Update,
+    zotero_highlight = Highlight, zotero_update = Update, zotero_bg = Bg, zotero_indicator = Indicator,
+    zotero_webdav = Dav,
 }) do
     if type(mod) ~= "table" or mod.fork ~= FORK then
         foreign_modules[#foreign_modules + 1] = name
@@ -63,11 +76,19 @@ local function init_error(e)
     logger.err("Zotero: could not initialize:", tostring(e), debug.traceback())
 end
 
--- os.time() of the last sign of life of a sync that is running
+-- os.time() of the last sign of life of a foreground task (maintenance)
 local sync_alive_at
 
 local function syncBusy()
-    return sync_alive_at ~= nil and os.time() - sync_alive_at < 300
+    return Bg.busy("sync") or (sync_alive_at ~= nil and os.time() - sync_alive_at < 300)
+end
+
+--- The reader, if a document is open in it now.
+local function currentReader()
+    local ReaderUI = package.loaded["apps/reader/readerui"]
+    local ui = ReaderUI and ReaderUI.instance
+    if ui and ui.document then return ui end
+    return nil
 end
 
 local function readableStatus(value)
@@ -168,11 +189,153 @@ local ZoteroBrowser = Menu:extend({
     -- Slightly ugly using the option below, but better than truncated single line:
     multilines_show_more_text = true,
 })
+
+-- A button of the title bar whose picture is a file (the plugin's own icons).
+local FileIconButton = IconButton:extend{ icon_file = nil }
+function FileIconButton:init()
+    self.image = IconWidget:new{ file = self.icon_file, width = self.width, height = self.height }
+    self.show_parent = self.show_parent or self
+    self.horizontal_group = HorizontalGroup:new{}
+    table.insert(self.horizontal_group, HorizontalSpan:new{})
+    table.insert(self.horizontal_group, self.image)
+    table.insert(self.horizontal_group, HorizontalSpan:new{})
+    self.button = VerticalGroup:new{}
+    table.insert(self.button, VerticalSpan:new{})
+    table.insert(self.button, self.horizontal_group)
+    table.insert(self.button, VerticalSpan:new{})
+    self[1] = self.button
+    self:update()
+end
+function FileIconButton:setIconFile(path)
+    if path and path ~= self.icon_file then
+        self.icon_file = path
+        self:free()
+        self:init()
+    end
+end
+
 function ZoteroBrowser:init()
     Menu.init(self)
     self.paths = {}
     self.keys = {}
+    self.libs = {}
+    pcall(self.addTitleButtons, self)
 end
+
+--- Two more buttons in the title bar: the order of the entries (beside the
+-- search button) and a sync (beside the close button).
+function ZoteroBrowser:addTitleButtons()
+    local tb = self.title_bar
+    if not tb or not tb.left_button or not tb.right_button then return end
+    local icons = ZoteroAPI.zotero_dir .. "/icons"
+    local size = tb.left_button.width
+    local pad = tb.button_padding
+    local gap = math.floor(size * 0.35)
+    local W = tb.width or Screen:getWidth()
+    self.sort_button = FileIconButton:new{
+        icon_file = Icons.svg("zotero.sort", icons), width = size, height = size, padding = pad,
+        overlap_offset = { pad + size + gap, 0 },
+        callback = function() self:showSortMenu() end,
+        show_parent = self.show_parent or self,
+    }
+    self.sync_button = FileIconButton:new{
+        icon_file = Icons.svg(Bg.busy("sync") and "zotero.sync.busy" or "zotero.sync", icons), width = size, height = size, padding = pad,
+        overlap_offset = { W - 2 * pad - 2 * size - gap - pad, 0 },
+        callback = function() self:onSyncButton() end,
+        hold_callback = function() if self.plugin then self.plugin:showLastReport() end end,
+        show_parent = self.show_parent or self,
+    }
+    -- first in the bar: their taps come before those of the wide tap zones
+    -- of the search and close buttons
+    table.insert(tb, 1, self.sync_button)
+    table.insert(tb, 1, self.sort_button)
+end
+
+function ZoteroBrowser:onSyncButton()
+    if not self.plugin then return end
+    if Bg.busy("sync") then
+        local ConfirmBox = require("ui/widget/confirmbox")
+        UIManager:show(ConfirmBox:new({
+            text = _("Stop the Zotero sync?\n\nIt stops after the piece of work it is doing; what is done so far is kept."),
+            ok_text = _("Stop"),
+            cancel_text = _("Continue"),
+            ok_callback = function() self.plugin:stopSync() end,
+        }))
+    else
+        self.plugin:onZoteroSyncAction()
+    end
+end
+
+--- A sync started, reported or ended: the sync button and the subtitle say so.
+function ZoteroBrowser:syncStateChanged(jobs)
+    local busy
+    for __, job in ipairs(jobs or {}) do if job.kind == "sync" then busy = job end end
+    if self.sync_button then
+        local want = Icons.svg(busy and "zotero.sync.busy" or "zotero.sync", ZoteroAPI.zotero_dir .. "/icons")
+        if want ~= self.sync_button.icon_file then
+            self.sync_button:setIconFile(want)
+            if self.title_bar and self.title_bar.dimen then UIManager:setDirty(self.show_parent or self, "ui", self.title_bar.dimen) end
+        end
+    end
+    local text = busy and (_("syncing") .. ": " .. shortStatusOf(busy)) or nil
+    if text ~= self.sync_text then
+        self.sync_text = text
+        if self.status_pending then return end
+        -- (the subtitle is repainted at most every few seconds)
+        local wait = 2.5 - (os.time() - (self.status_painted or 0))
+        local function paint()
+            self.status_pending = nil
+            self.status_painted = os.time()
+            if self.title_bar and self.title_bar.setSubTitle then self.title_bar:setSubTitle(self:subtitle()) end
+        end
+        if wait <= 0 or not self.sync_text then paint() else self.status_pending = true; UIManager:scheduleIn(wait, paint) end
+    end
+end
+
+function ZoteroBrowser:subtitle()
+    local path = self:zPath()
+    if self.sync_text then return self.sync_text .. "  ·  " .. path end
+    return path
+end
+
+--- The order of the entries.
+function ZoteroBrowser:showSortMenu()
+    local sort = ZoteroAPI.getSort()
+    local dialog
+    local function choose(by)
+        local desc
+        if by == sort.by then
+            desc = not sort.desc
+        else
+            desc = by == "added" or by == "modified" -- newest first; names from A
+        end
+        ZoteroAPI.setSort(by, desc)
+        ZoteroAPI.saveSettingsToFile()
+        UIManager:close(dialog)
+        self:refreshView()
+    end
+    local function label(by, name)
+        if sort.by ~= by then return name end
+        local dir
+        if by == "added" or by == "modified" then
+            dir = sort.desc and _("newest first") or _("oldest first")
+        else
+            dir = sort.desc and _("Z to A") or _("A to Z")
+        end
+        return "✓ " .. name .. " · " .. dir
+    end
+    local buttons = {}
+    for __, opt in ipairs({ { "added", _("Date added") }, { "modified", _("Date modified") }, { "author", _("Author") }, { "title", _("Title") } }) do
+        buttons[#buttons + 1] = { { text = label(opt[1], opt[2]), align = "left", callback = function() choose(opt[1]) end } }
+    end
+    dialog = ButtonDialog:new({
+        title = _("Sort entries by") .. "\n" .. _("(again on the chosen one: the other way round)"),
+        title_align = "center",
+        buttons = buttons,
+    })
+    UIManager:show(dialog)
+end
+
 -- Show search input
 function ZoteroBrowser:onLeftButtonTap()
     local search_query_dialog
@@ -180,7 +343,7 @@ function ZoteroBrowser:onLeftButtonTap()
         title = _("Search Zotero titles"),
         input = "",
         input_hint = "search query",
-        description = _("This will search title and first author of all entries."),
+        description = _("This will search title and first author of all entries, in all libraries."),
         buttons = {
             {
                 {
@@ -207,6 +370,7 @@ end
 function ZoteroBrowser:onReturn()
     table.remove(self.paths, #self.paths)
     table.remove(self.keys, #self.keys)
+    table.remove(self.libs, #self.libs)
     local top = self.keys[#self.keys]
     if top == nil then
         self:displayCollection(nil)
@@ -214,17 +378,34 @@ function ZoteroBrowser:onReturn()
         -- back to an earlier search: shown again (it puts itself on the path)
         local query = table.remove(self.paths, #self.paths)
         table.remove(self.keys, #self.keys)
-        self:displaySearchResults(query)
+        local lid = table.remove(self.libs, #self.libs)
+        self:displaySearchResults(query, lid)
     else
         self:displayCollection(top)
     end
     return true
 end
-function ZoteroBrowser:openResolvedFile(full_path)
-    if self.download_dialog then
-        UIManager:close(self.download_dialog)
-        self.download_dialog = nil
+
+--- Show the current list again (another order, a sync changed it), on the
+-- same page if wanted.
+function ZoteroBrowser:refreshView(keep_page)
+    if not self.item_table then return end
+    local page = self.page
+    local top = self.keys[#self.keys]
+    if top == "search" then
+        local query = table.remove(self.paths, #self.paths)
+        table.remove(self.keys, #self.keys)
+        local lid = table.remove(self.libs, #self.libs)
+        self:displaySearchResults(query, lid)
+    else
+        self:displayCollection(top)
     end
+    if keep_page and page and self.page_num and page > 1 then
+        self:onGotoPage(math.min(page, self.page_num))
+    end
+end
+
+function ZoteroBrowser:openResolvedFile(full_path)
     configureZoteroDocumentSettings(full_path)
     local close_cb = self.close_callback
     UIManager:scheduleIn(0.05, function()
@@ -245,6 +426,9 @@ function ZoteroBrowser:showOpenError(e)
         icon = "notice-warning",
     }))
 end
+--- Open an attachment; download its file first if it is not here. The
+-- download runs in the background with its progress shown, and can be
+-- cancelled; the file opens when it is complete.
 function ZoteroBrowser:openAttachment(key)
     local local_path, local_err = ZoteroAPI.tryResolveLocalAttachment(key)
     if local_err ~= nil then
@@ -255,20 +439,34 @@ function ZoteroBrowser:openAttachment(key)
         self:openResolvedFile(local_path)
         return
     end
-    self.download_dialog = InfoMessage:new({
-        text = _("Downloading file"),
-        timeout = 5,
-        icon = "notice-info",
-    })
-    UIManager:show(self.download_dialog)
+    local item = ZoteroAPI.getItem(key)
+    local name = item and item.data and (item.data.filename or item.data.title) or key
     NetworkMgr:runWhenOnline(function()
-        local full_path, e = ZoteroAPI.downloadAndGetPath(key)
-        if e ~= nil or full_path == nil then
-            UIManager:close(self.download_dialog)
-            self:showOpenError(e)
-        else
-            self:openResolvedFile(full_path)
-        end
+        local dialog, job
+        dialog = Indicator.downloadDialog({
+            title = _("Downloading"),
+            name_text = name,
+            on_cancel = function() if job then Bg.stop(job) end end,
+        })
+        dialog:show()
+        job = Bg.start(_("Zotero download"), function()
+            local path, err = ZoteroAPI.downloadAndGetPath(key, nil, {
+                progress = function(bytes, total) dialog:report(bytes, total) end,
+            })
+            return { path = path, err = err }
+        end, {
+            kind = "download",
+            on_done = function(j)
+                dialog:close()
+                if j.stopped then return end
+                local res = j.result or {}
+                if res.path then
+                    self:openResolvedFile(res.path)
+                else
+                    self:showOpenError(res.err or j.error)
+                end
+            end,
+        })
     end)
 end
 local KIND_LABEL = { pdf = "PDF", epub = "EPUB", html = _("Web snapshot") }
@@ -318,13 +516,14 @@ function ZoteroBrowser:openItem(key, title)
     UIManager:show(dialog)
 end
 function ZoteroBrowser:onMenuSelect(item)
-    if item.type == "collection" then
+    if item.type == "collection" or item.type == "library" then
         table.insert(self.paths, item.text)
         table.insert(self.keys, item.key)
+        table.insert(self.libs, item.library or false)
         self:displayCollection(item.key)
     elseif item.type == "wildcard_collection" then
         -- (one level, as a search for everything: one Return leads back)
-        self:displaySearchResults("")
+        self:displaySearchResults("", item.library)
     elseif item.type == "item" then
         self:openItem(item.key, item.text)
     elseif item.type == "attachment" then
@@ -335,14 +534,13 @@ function ZoteroBrowser:onMenuSelect(item)
 end
 function ZoteroBrowser:onMenuHold(item)
     if item.type == "item" then
-        --table.insert(self.paths, item.key)
-        --table.insert(self.keys, item.key)
-        --self:displayAttachments(item.key)
         local itemDetails = ZoteroAPI.getItemWithAttachments(item.key)
         local itemInfo = itemInfoViewer:new()
         itemInfo:show(itemDetails, function(key)
             self:openAttachment(key)
         end)
+    elseif item.type == "library" then
+        if self.plugin then self.plugin:showGroupMenu(item.groupID, item.text) end
     elseif item.type == "collection" then
         local is_offline_enabled = ZoteroAPI.isOfflineCollection(item.key)
         local button_label = "▢  Download this collection during sync"
@@ -375,25 +573,42 @@ function ZoteroBrowser:onMenuHold(item)
         UIManager:show(collection_dialog)
     end
 end
-function ZoteroBrowser:displaySearchResults(query)
-    local items = ZoteroAPI.displaySearchResults(query)
+function ZoteroBrowser:displaySearchResults(query, lid)
+    local items = ZoteroAPI.displaySearchResults(query, lid or nil)
     table.insert(self.paths, query)
     table.insert(self.keys, "search")
+    table.insert(self.libs, lid or false)
     items = self:addLabelIfEmpty(items, "No search results!")
     self:setItems(items)
 end
 
+--- A collection; nil: the top of the user's library, with "All Items" and
+-- the group libraries; "/g<id>": the top of a group library.
 function ZoteroBrowser:displayCollection(collection_id)
     local items = ZoteroAPI.displayCollection(collection_id)
+    local group = type(collection_id) == "string" and collection_id:match("^/g(%d+)$")
     if collection_id == nil then
-        if table_empty(items) then
+        local groups = ZoteroAPI.displayLibraries()
+        if table_empty(items) and table_empty(groups) then
             items = self:addLabelIfEmpty(items, "Library is empty! Synchronise first...")
         else
+            -- the collections, then the group libraries, then the entries
+            local n = 0
+            while items[n + 1] and items[n + 1].type == "collection" do n = n + 1 end
+            for i, g in ipairs(groups) do table.insert(items, n + i, g) end
             table.insert(items, 1, {
                 ["text"] = _("All Items"),
                 ["type"] = "wildcard_collection",
+                library = 1,
             })
         end
+    elseif group then
+        local lib = ZoteroAPI.groupLibrary(group)
+        table.insert(items, 1, {
+            ["text"] = _("All Items"),
+            ["type"] = "wildcard_collection",
+            library = lib and lib.id or nil,
+        })
     else
         items = self:addLabelIfEmpty(items)
     end
@@ -423,8 +638,10 @@ function ZoteroBrowser:zPath()
     local path = "HOME"
     if #self.paths > 0 then
         if self.keys[#self.keys] == "search" then
+            local before = {}
+            for i = 1, #self.paths - 1 do before[i] = self.paths[i] end
             if self.paths[#self.paths] == "" then
-                path = "/" .. _("All Items")
+                path = "/" .. table.concat(before, "/") .. (#before > 0 and "/" or "") .. _("All Items")
             else
                 path = "Search results: '" .. self.paths[#self.paths] .. "'"
             end
@@ -436,13 +653,13 @@ function ZoteroBrowser:zPath()
 end
 
 function ZoteroBrowser:setItems(items, subtitle)
-    local subtitle = self:zPath()
-    self:switchItemTable("Zotero Browser", items, nil, nil, subtitle)
+    self:switchItemTable("Zotero Browser", items, nil, nil, self:subtitle())
 end
 
 --- What a row shows besides its text. Collections are set in bold, with a
--- folder; an entry gets the picture of the file a tap opens, black when that
--- file is on this device, grey when it has to be downloaded first.
+-- folder (group libraries with two people); an entry gets the picture of the
+-- file a tap opens, black when that file is on this device, grey when it has
+-- to be downloaded first.
 -- Worked out for the rows of the page that is shown, when it is shown: a
 -- collection may hold hundreds of entries, and each one costs a look at the
 -- database and at the storage folder.
@@ -465,6 +682,9 @@ function ZoteroBrowser:decoratePage()
             if item.type == "collection" or item.type == "wildcard_collection" then
                 item.bold = true
                 item.state = Icons.folder(m, item.offline)
+            elseif item.type == "library" then
+                item.bold = true
+                item.state = Icons.group(m)
             elseif item.type == "item" or item.type == "attachment" then
                 local ok, kind, on_device = pcall(ZoteroAPI.entryFileState, item.key, item.type == "attachment")
                 if not ok then
@@ -482,6 +702,14 @@ function ZoteroBrowser:updateItems(select_number, no_recalculate_dimen)
     local ok, err = pcall(self.decoratePage, self)
     if not ok then logger.warn("Zotero: browser rows not decorated:", tostring(err)) end
     Menu.updateItems(self, select_number, no_recalculate_dimen)
+end
+
+function ZoteroBrowser:onCloseWidget()
+    if browser_shown == self then
+        browser_shown = nil
+        updateIndicator()
+    end
+    if Menu.onCloseWidget then return Menu.onCloseWidget(self) end
 end
 local Plugin = WidgetContainer:new({
     name = "zoteroatelier",
@@ -795,14 +1023,17 @@ function Plugin:onAnnotationsModified(items)
 end
 
 function Plugin:onCloseDocument()
-    -- No upload here: sending to Zotero happens only when a sync is asked for.
-    -- But while the book is still open, work out the Zotero positions of new
-    -- EPUB highlights, so that a later sync can send them with the book closed.
+    -- While the book is still open, work out the Zotero positions of new EPUB
+    -- highlights, so that the sync can send them with the book closed. The
+    -- sync itself follows a moment later, in the background (if automatic
+    -- syncs are on and the device is online).
     if not init_done or not self.ui or not self.ui.document then return end
     local ui = self.ui
+    local zotero_doc = false
     local ok, err = pcall(function()
-        local key, file_path
-        if ui.rolling then key, file_path = AnnotationSync.identify(ui) end
+        local key, file_path = AnnotationSync.identify(ui)
+        zotero_doc = key ~= nil
+        if not ui.rolling then key = nil end
         local kind = key and AnnotationSync.kindOf(file_path)
         if kind then
             local n = Doc.cacheEpubPositions(ui, kind)
@@ -815,7 +1046,9 @@ function Plugin:onCloseDocument()
         end
     end)
     if not ok then logger.warn("Zotero: preparing positions on closing failed:", tostring(err)) end
+    if zotero_doc then self:autoSync("a Zotero document was closed", 10, 3) end
 end
+
 
 --- Keep the device from dozing while a sync runs. On Android the only means
 -- the reader has is its "keep screen on" window flag; the user's own screen
@@ -842,9 +1075,6 @@ local function keepAwake(on)
     end)
 end
 
---- Run a sync: one at a time, online, with progress messages the user can
--- stop, and with a message instead of silence if it fails unexpectedly.
--- @param fn function(progress, stopped)
 -- ---------------------------------------------------------------------------
 -- Updates of the plugin (zotero_update.lua)
 -- ---------------------------------------------------------------------------
@@ -1012,31 +1242,210 @@ function Plugin:getUpdateMenu()
     }
 end
 
-function Plugin:runSync(fn)
+-- ---------------------------------------------------------------------------
+-- Syncs run in the background (zotero_bg.lua): the reader stays usable, a
+-- small box in a corner says what the sync is doing (zotero_indicator.lua),
+-- and what came of it is told briefly at the end.
+-- ---------------------------------------------------------------------------
+
+local last_report    -- { at, lines, problems, error, auto }
+-- browser_shown: the browser while it is open (it shows the sync state itself)
+
+local function autoSyncEnabled()
+    return ZoteroAPI.getSettings():readSetting("sync_auto") ~= false
+end
+local function indicatorCorner()
+    local c = ZoteroAPI.getSettings():readSetting("indicator_corner")
+    for __, k in ipairs(Indicator.CORNERS) do if k == c then return c end end
+    return "top_right"
+end
+
+--- A sync's status in a few words, for the indicator.
+local function shortStatus(job)
+    if job.stopped then return _("stopping…") end
+    local msg = tostring(job.status or "")
+    local n = msg:match("(%d+/%d+)")
+    local pct = msg:match("(%d+)%%")
+    if job.kind == "download" then
+        return pct and string.format(_("download %s%%"), pct) or _("download")
+    end
+    if msg:find("^Syncing items") then return pct and string.format(_("items %s%%"), pct) or _("items") end
+    if msg:find("^Syncing collections") then return _("collections") end
+    if msg:find("^Syncing annotations") then return n and string.format(_("annotations %s"), n) or _("annotations") end
+    if msg:find("^Checking attachment") then return n and string.format(_("files %s"), n) or _("files") end
+    if msg:find("^Downloading") then return n and string.format(_("downloads %s"), n) or _("downloads") end
+    if msg:find("^Comparing") then return _("comparing") end
+    if msg:find("^Updating local index") then return _("index") end
+    if msg:find("new version") or msg:find("^Installing version") then return _("plugin update") end
+    if msg:find("^Asking Zotero") or msg:find("^Checking Zotero access") then return _("checking") end
+    return _("syncing")
+end
+
+shortStatusOf = shortStatus
+
+local suspended = false
+local indicator_waits = false
+updateIndicator = function()
+    local jobs = Bg.jobs()
+    if #jobs == 0 or suspended then
+        Indicator.hide()
+    else
+        local job = jobs[1]
+        for __, j in ipairs(jobs) do if j.kind == "sync" then job = j break end end
+        if browser_shown then
+            Indicator.hide()
+        elseif not Indicator.shown() and Bg.age(job) < 1 then
+            -- (a sync over within a second shows nothing: no flash on the screen)
+            if not indicator_waits then
+                indicator_waits = true
+                UIManager:scheduleIn(1, function() indicator_waits = false; updateIndicator() end)
+            end
+        else
+            Indicator.show(shortStatus(job), { corner = indicatorCorner(),
+                icon_file = Icons.svg("zotero.sync", ZoteroAPI.zotero_dir .. "/icons") })
+        end
+    end
+    if browser_shown then pcall(browser_shown.syncStateChanged, browser_shown, jobs) end
+end
+
+local function lastSyncAge()
+    return os.time() - (tonumber(ZoteroAPI.getSettings():readSetting("last_sync_at")) or 0)
+end
+
+--- Run a sync in the background: one at a time, online.
+-- @param fn function(progress, stopped) -> report { error, lines, problems, changes, restart_for }
+-- @param opts.auto an automatic sync: only if the device is online already
+--        (Wi-Fi is never turned on for it), and quiet unless something came of it
+function Plugin:runSync(fn, opts)
+    opts = opts or {}
     if syncBusy() then
-        UIManager:show(InfoMessage:new({
-            text = _("A Zotero sync is already running."),
-            timeout = 3,
-        }))
+        if not opts.auto then
+            Notification:notify(_("A Zotero sync is already running."), Notification.SOURCE_ALWAYS_SHOW)
+        end
+        return false
+    end
+    local function start()
+        if syncBusy() then return end
+        Bg.start(_("Zotero sync"), function()
+            keepAwake(true)
+            local function progress(msg, fraction)
+                Bg.status(readableStatus(msg), fraction)
+                return Bg.pause()
+            end
+            local ok, report = xpcall(function() return fn(progress, Bg.stopped) end, debug.traceback)
+            keepAwake(false)
+            if not ok then error(report, 0) end
+            return report
+        end, {
+            kind = "sync",
+            status = "Synchronizing…",
+            on_done = function(job) self:syncFinished(job, opts) end,
+        })
+    end
+    if opts.auto then
+        local ok, connected = pcall(function() return NetworkMgr:isConnected() end)
+        if ok and connected then start() end
+    else
+        NetworkMgr:runWhenOnline(start)
+    end
+    return true
+end
+
+--- Stop a sync that is running (at the end of the piece of work it is doing).
+function Plugin:stopSync()
+    for __, job in ipairs(Bg.jobs("sync")) do Bg.stop(job) end
+end
+
+--- After a sync: tell what came of it, refresh what shows the library.
+function Plugin:syncFinished(job, opts)
+    local report = type(job.result) == "table" and job.result or {}
+    local lines = type(report.lines) == "table" and report.lines or {}
+    local err = report.error
+    if not job.ok then
+        logger.err("Zotero: sync failed:", tostring(job.error))
+        err = _("The Zotero sync failed unexpectedly. See crash.log for details.") .. "\n" .. tostring(job.error):match("^[^\n]*")
+    elseif job.stopped and not err then
+        err = ZoteroAPI.CANCELLED
+    end
+    last_report = { at = os.time(), lines = lines, problems = report.problems or 0, error = err, auto = opts.auto }
+    ZoteroAPI.saveSettingsToFile()
+    -- the list and the open document show the library as it is now
+    if browser_shown then pcall(browser_shown.refreshView, browser_shown, true) end
+    local reader = currentReader()
+    if reader and report.reader_changed then UIManager:setDirty(reader.dialog or "all", "ui") end
+    -- what came of it
+    if err == ZoteroAPI.CANCELLED then
+        Notification:notify(_("Zotero sync stopped."), Notification.SOURCE_ALWAYS_SHOW)
+    elseif err then
+        if opts.auto then
+            Notification:notify(_("Zotero sync failed: ") .. tostring(err):match("^[^\n]*"), Notification.SOURCE_ALWAYS_SHOW)
+        else
+            local text = readableStatus(err)
+            if #lines > 0 then text = text .. "\n\n" .. table.concat(lines, "\n") end
+            UIManager:show(InfoMessage:new({ text = text, icon = "notice-warning" }))
+        end
+    elseif (report.problems or 0) > 0 and not opts.auto then
+        UIManager:show(InfoMessage:new({ text = _("Zotero sync done.") .. "\n\n" .. table.concat(lines, "\n") }))
+    elseif (report.problems or 0) > 0 then
+        Notification:notify(string.format(_("Zotero synced; %d to look at (Zotero Atelier > Last sync report)."), report.problems), Notification.SOURCE_ALWAYS_SHOW)
+    elseif not opts.auto or (report.changes or 0) > 0 then
+        local short = {}
+        for i = 1, math.min(3, #lines) do short[#short + 1] = lines[i] end
+        Notification:notify(#short > 0 and (_("Zotero: ") .. table.concat(short, "; ")) or _("Zotero: everything is up to date."),
+            Notification.SOURCE_ALWAYS_SHOW)
+    end
+    if report.restart_for then
+        local version = report.restart_for
+        UIManager:scheduleIn(0.2, function() offerRestart(version) end)
+    end
+end
+
+--- (for tests) the report of the last sync
+function Plugin.lastReport() return last_report end
+
+--- The report of the last sync, for the menu.
+function Plugin:showLastReport()
+    if not last_report then
+        UIManager:show(InfoMessage:new({ text = _("No sync has run since KOReader was started.") }))
         return
     end
-    NetworkMgr:runWhenOnline(function()
-        Trapper:wrap(function()
-            sync_alive_at = os.time()
-            Trapper:setPausedText(_("Stop the Zotero sync?"), _("Stop"), _("Continue"))
-            local progress, stopped = makeProgress()
-            keepAwake(true)
-            local ok, err = xpcall(function() fn(progress, stopped) end, debug.traceback)
-            keepAwake(false)
-            sync_alive_at = nil
-            Trapper:setPausedText(nil, nil, nil)
-            if not ok then
-                logger.err("Zotero: sync failed:", tostring(err))
-                Trapper:info(_("The Zotero sync failed unexpectedly. See crash.log for details.")
-                    .. "\n" .. tostring(err):match("^[^\n]*"))
-            end
-        end)
-    end)
+    local head = os.date("%Y-%m-%d %H:%M", last_report.at) .. (last_report.auto and (" · " .. _("automatic")) or "")
+    local body = {}
+    if last_report.error then body[#body + 1] = readableStatus(last_report.error) end
+    for __, l in ipairs(last_report.lines) do body[#body + 1] = l end
+    if #body == 0 then body[1] = _("Everything is up to date.") end
+    UIManager:show(InfoMessage:new({ text = head .. "\n\n" .. table.concat(body, "\n") }))
+end
+
+-- one automatic sync waits at a time, whichever instance of the plugin asked
+local auto_pending
+--- An automatic sync, if it is on, the account is set, nothing runs, and the
+-- last sync is older than min_age seconds.
+function Plugin:autoSync(reason, min_age, delay)
+    if not init_done or #foreign_modules > 0 or not autoSyncEnabled() then return end
+    if ZoteroAPI.getUserID() == "" or ZoteroAPI.getAPIKey() == "" then return end
+    if syncBusy() or lastSyncAge() < min_age then return end
+    if auto_pending then UIManager:unschedule(auto_pending) end
+    auto_pending = function()
+        auto_pending = nil
+        if syncBusy() or lastSyncAge() < min_age then return end
+        logger.info("Zotero: automatic sync:", reason)
+        self:onZoteroSyncAction(true)
+    end
+    UIManager:scheduleIn(delay or 2, auto_pending)
+end
+
+function Plugin:onNetworkConnected()
+    self:autoSync("the network came up", 1800, 6)
+end
+function Plugin:onSuspend()
+    suspended = true
+    Indicator.hide()
+end
+function Plugin:onResume()
+    suspended = false
+    if Bg.busy() then updateIndicator() end
+    self:autoSync("the device woke up", 1800, 8)
 end
 
 --- "Sync document annotations": download what changed in Zotero, merge with
@@ -1064,51 +1473,57 @@ function Plugin:syncOpenDocumentAnnotations()
     end
     self:runSync(function(progress, stopped)
         progress(_("Synchronizing annotations with Zotero…"))
-        local lines = {}
+        local lines, problems = {}, 0
         local online_error = ZoteroAPI.pull(progress)
-        if stopped() then
-            Trapper:info(ZoteroAPI.CANCELLED)
-            return
-        end
-        if not ui.document then return end -- closed meanwhile
+        if stopped() then return { error = ZoteroAPI.CANCELLED } end
+        if not ui.document or currentReader() ~= ui then return { error = _("The document was closed before its annotations were synchronized.") } end
         if online_error then
             lines[#lines + 1] = _("Zotero could not be reached; nothing was uploaded.") .. "\n" .. readableStatus(online_error)
+            problems = problems + 1
         end
-        local can_push = online_error == nil and ZoteroAPI.canWrite()
-        local ok, stats, repaired = pcall(AnnotationSync.openDocument, ui, function(fn) self:guarded(fn) end, { push = can_push })
-        if not ok or not stats then
-            logger.err("Zotero: document annotation sync failed:", tostring(stats))
-            Trapper:info(_("Annotation sync failed. See crash.log for details."))
-            return
-        end
-        self:afterAnnotationChanges(stats, repaired, true)
-        -- reading position: Zotero's, if it is news; otherwise ours goes up
-        local went = self:applyZoteroPosition(true)
-        local sent = false
-        if can_push and ui.document then
-            local pok, res = pcall(Position.pushOpen, ui, key)
-            if not pok then logger.warn("Zotero: sending the reading position failed:", tostring(res)) end
-            sent = pok and res == "sent"
-        end
-        local done, problems = Sync.summary(stats)
-        if #done == 0 and #problems == 0 and not online_error then
+        local can_push = online_error == nil and ZoteroAPI.canWrite(key)
+        local result = Bg.critical(function()
+            if not ui.document then return nil end
+            local ok, stats, repaired = pcall(AnnotationSync.openDocument, ui, function(fn) self:guarded(fn) end, { push = can_push })
+            if not ok or not stats then
+                logger.err("Zotero: document annotation sync failed:", tostring(stats))
+                return { failed = true }
+            end
+            self:afterAnnotationChanges(stats, repaired, true)
+            -- reading position: Zotero's, if it is news; otherwise ours goes up
+            local went = self:applyZoteroPosition(true)
+            local sent = false
+            if can_push and ui.document then
+                local pok, res = pcall(Position.pushOpen, ui, key)
+                if not pok then logger.warn("Zotero: sending the reading position failed:", tostring(res)) end
+                sent = pok and res == "sent"
+            end
+            return { stats = stats, went = went, sent = sent }
+        end)
+        if not result then return { error = _("The document was closed before its annotations were synchronized.") } end
+        if result.failed then return { error = _("Annotation sync failed. See crash.log for details.") } end
+        local stats = result.stats
+        local done, trouble = Sync.summary(stats)
+        if #done == 0 and #trouble == 0 and not online_error then
             lines[#lines + 1] = _("Annotations are up to date.")
         end
-        if went then
-            lines[#lines + 1] = string.format(_("Continued where Zotero was last read: page %s (Back returns)."), tostring(went))
-        elseif sent then
+        if result.went then
+            lines[#lines + 1] = string.format(_("Continued where Zotero was last read: page %s (Back returns)."), tostring(result.went))
+        elseif result.sent then
             lines[#lines + 1] = _("Reading position sent to Zotero.")
         end
         for __, l in ipairs(done) do lines[#lines + 1] = l end
-        for __, l in ipairs(problems) do lines[#lines + 1] = l end
-        if online_error == nil and not ZoteroAPI.canWrite() and stats.pending > 0 then
+        for __, l in ipairs(trouble) do lines[#lines + 1] = l end
+        problems = problems + #trouble
+        if online_error == nil and not ZoteroAPI.canWrite(key) and stats.pending > 0 then
             lines[#lines + 1] = _("The API key is read-only: changes made here were not uploaded.")
+            problems = problems + 1
         end
         if stats.unsupported > 0 then
             lines[#lines + 1] = string.format(_("%d Zotero annotations of other kinds (notes, images, drawings) are not shown in KOReader."), stats.unsupported)
         end
         for i = 1, math.min(3, #stats.messages) do lines[#lines + 1] = "· " .. stats.messages[i] end
-        Trapper:info(table.concat(lines, "\n"))
+        return { lines = lines, problems = problems, changes = #done }
     end)
 end
 
@@ -1133,6 +1548,11 @@ function Plugin:init()
     xpcall(self.initBrowser, init_error, self)
     self.initialized = init_done
     logger.dbg("Zotero: initialized:", init_done)
+    if init_done and not auto_started then
+        -- once per start of KOReader: a sync if the last one is an hour old
+        auto_started = true
+        self:autoSync("KOReader started", 3600, 20)
+    end
 end
 
 function Plugin:checkInitialized()
@@ -1170,6 +1590,8 @@ function Plugin:initAPI()
     Highlight.install(ZoteroAPI.getSettings())
     -- highlights without a colour of their own are sent with the reader's default colour
     Annotations.setDefaultColor(G_reader_settings:readSetting("highlight_color") or "yellow")
+    -- background work shows in the indicator (and in the browser, while it is open)
+    Bg.listen(function() updateIndicator() end)
 end
 function Plugin:initBrowser()
     self.small_font_face = Font:getFace("smallffont")
@@ -1183,6 +1605,7 @@ function Plugin:initBrowser()
         end,
         items_per_page = self:getItemsPerPage(),
     })
+    self.browser.plugin = self
     self.zotero_dialog = FrameContainer:new({
         padding = 0,
         bordersize = 0,
@@ -1201,9 +1624,17 @@ function Plugin:getZoteroSubMenu()
                 end,
             },
             {
-                text = _("Synchronize"),
+                text_func = function()
+                    return Bg.busy("sync") and _("Stop the sync") or _("Synchronize")
+                end,
                 callback = function()
-                    self:onZoteroSyncAction()
+                    if Bg.busy("sync") then self:stopSync() else self:onZoteroSyncAction() end
+                end,
+            },
+            {
+                text = _("Last sync report"),
+                callback = function()
+                    self:showLastReport()
                 end,
             },
             {
@@ -1243,6 +1674,22 @@ function Plugin:getZoteroSubMenu()
                         end,
                     },
                     {
+                        text = _("Look at every document at the next sync"),
+                        help_text = _("A sync passes over documents in which nothing changed on either side since the last sync. This makes the next sync look at all of them again."),
+                        callback = function()
+                            ZoteroAPI.forgetAnnotationState()
+                            Notification:notify(_("The next sync looks at every document."), Notification.SOURCE_ALWAYS_SHOW)
+                        end,
+                    },
+                    {
+                        text = _("Try failed downloads again"),
+                        help_text = _("A file the server does not have is not asked for again until its attachment changes in Zotero (or a day has passed). This makes the next sync try all of them."),
+                        callback = function()
+                            ZoteroAPI.forgetDownloadFailures()
+                            Notification:notify(_("The next sync tries those files again."), Notification.SOURCE_ALWAYS_SHOW)
+                        end,
+                    },
+                    {
                         text = _("Re-scan storage for local items"),
                         callback = function()
                             self:onZoteroRescanAction()
@@ -1251,6 +1698,10 @@ function Plugin:getZoteroSubMenu()
                     {
                         text = _("Resync entire collection"),
                         callback = function()
+                            if syncBusy() then
+                                Notification:notify(_("A Zotero sync is already running."), Notification.SOURCE_ALWAYS_SHOW)
+                                return
+                            end
                             ZoteroAPI.resetSyncState()
                             self:onZoteroSyncAction()
                         end,
@@ -1267,6 +1718,41 @@ function Plugin:getZoteroSubMenu()
                         text = _("Configure Zotero account"),
                         callback = function()
                             self:setAccount()
+                        end,
+                    },
+                    {
+                        text = _("Sync automatically"),
+                        help_text = _("Syncs in the background, when the device is online already (Wi-Fi is never turned on for them): a few seconds after a Zotero document is closed; when the Zotero browser is opened and the last sync is ten minutes old; when Wi-Fi comes up or the device wakes and the last sync is half an hour old; when KOReader starts and the last sync is an hour old. The reader stays usable; a small box in a corner shows what the sync is doing."),
+                        checked_func = function() return autoSyncEnabled() end,
+                        callback = function()
+                            ZoteroAPI.getSettings():saveSetting("sync_auto", not autoSyncEnabled())
+                            ZoteroAPI.saveSettingsToFile()
+                        end,
+                    },
+                    {
+                        text = _("Sync indicator"),
+                        sub_item_table_func = function()
+                            local names = { top_right = _("Top right corner"), top_left = _("Top left corner"),
+                                bottom_right = _("Bottom right corner"), bottom_left = _("Bottom left corner") }
+                            local out = {}
+                            for __, corner in ipairs(Indicator.CORNERS) do
+                                out[#out + 1] = {
+                                    text = names[corner], radio = true,
+                                    checked_func = function() return indicatorCorner() == corner end,
+                                    callback = function()
+                                        ZoteroAPI.getSettings():saveSetting("indicator_corner", corner)
+                                        ZoteroAPI.saveSettingsToFile()
+                                        if Bg.busy() then updateIndicator() end
+                                    end,
+                                }
+                            end
+                            return out
+                        end,
+                    },
+                    {
+                        text = _("Group libraries"),
+                        sub_item_table_func = function()
+                            return self:getGroupsMenu()
                         end,
                     },
                     {
@@ -1530,6 +2016,8 @@ function Plugin:getZoteroSubMenu()
                             .. stats.attachments
                             .. "\n\tAnnotations:\t"
                             .. stats.annotations
+                            .. "\n\tGroup libraries:\t"
+                            .. stats.groups
                             .. "\n\nPDF Settings:\n\tWrite into PDF:\t"
                             .. write_pdf
                             .. "\n"
@@ -1542,6 +2030,187 @@ function Plugin:getZoteroSubMenu()
                 end,
             },
     }
+end
+
+-- ---------------------------------------------------------------------------
+-- Group libraries: which are synced, and where their files come from
+-- ---------------------------------------------------------------------------
+
+--- Set the WebDAV folder of a group (the address, folder, login that Group
+-- Linked Files uses in Zotero).
+function Plugin:editGroupDav(gid, name, done)
+    local cfg = ZoteroAPI.groupFiles(gid)
+    local dialog
+    dialog = MultiInputDialog:new({
+        title = string.format(_("WebDAV folder of %s"), name),
+        description = _("As set in Zotero under Settings > Group Linked Files: the server's address, the folder, your user name and WebDAV password (for HU-Box: set the WebDAV password in the HU-Box web interface, Settings > WebDAV)."),
+        fields = {
+            { description = _("Server"), text = cfg.server or Dav.DEFAULT_SERVER, hint = Dav.DEFAULT_SERVER },
+            { description = _("Folder"), text = cfg.path or "", hint = _("Library/Folder") },
+            { description = _("User name"), text = cfg.user or "", hint = _("user name") },
+            { description = _("WebDAV password"), text = cfg.password or "", hint = _("password"), text_type = "password" },
+        },
+        buttons = {
+            {
+                { text = _("Cancel"), id = "close", callback = function() UIManager:close(dialog) end },
+                {
+                    text = _("Save"),
+                    is_enter_default = true,
+                    callback = function()
+                        local f = dialog:getFields()
+                        UIManager:close(dialog)
+                        ZoteroAPI.setGroupFiles(gid, { mode = "webdav", server = f[1], path = f[2], user = f[3], password = f[4] })
+                        ZoteroAPI.saveSettingsToFile()
+                        if done then done() end
+                        self:testGroupDav(gid, name)
+                    end,
+                },
+            },
+        },
+    })
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+--- Look at a group's WebDAV folder and say what is there.
+function Plugin:testGroupDav(gid, name)
+    local cfg = ZoteroAPI.groupFiles(gid)
+    if not Dav.usable(cfg) then
+        UIManager:show(InfoMessage:new({ text = _("The WebDAV folder is not set up yet (address and user name)."), icon = "notice-warning" }))
+        return
+    end
+    NetworkMgr:runWhenOnline(function()
+        Bg.start(_("Zotero WebDAV check"), function()
+            local files, folders = ZoteroAPI.checkGroupDav(cfg)
+            return { files = files, folders = folders }
+        end, {
+            kind = "check",
+            on_done = function(job)
+                local r = job.result or {}
+                if r.files then
+                    UIManager:show(InfoMessage:new({ text = string.format(_("%s: the WebDAV folder works: %d files, %d folders."), name, r.files, r.folders or 0) }))
+                else
+                    UIManager:show(InfoMessage:new({ text = string.format(_("%s: the WebDAV folder could not be read:\n%s"), name, tostring(r.folders or job.error)), icon = "notice-warning" }))
+                end
+            end,
+        })
+    end)
+end
+
+--- The settings of one group (from the menu, or a long tap on it in the browser).
+function Plugin:groupMenuItems(gid, name)
+    return {
+        {
+            text = _("Sync this group"),
+            help_text = _("Off: the group's entries are removed from this device at the next sync (its files and your annotations in them stay), and it is no longer synced."),
+            checked_func = function() return not ZoteroAPI.skippedGroups()[tostring(gid)] end,
+            callback = function()
+                ZoteroAPI.setGroupSkipped(gid, not ZoteroAPI.skippedGroups()[tostring(gid)])
+                ZoteroAPI.saveSettingsToFile()
+            end,
+        },
+        {
+            text = _("Files from Zotero's storage"),
+            radio = true,
+            checked_func = function() return ZoteroAPI.groupFiles(gid).mode ~= "webdav" end,
+            callback = function()
+                local cfg = ZoteroAPI.groupFiles(gid)
+                cfg.mode = "zotero"
+                ZoteroAPI.setGroupFiles(gid, cfg)
+                ZoteroAPI.saveSettingsToFile()
+            end,
+        },
+        {
+            text = _("Files from a shared WebDAV folder (Group Linked Files)"),
+            help_text = _("For a group whose files are kept in a shared folder with the Zotero plugin Group Linked Files: each file is fetched from that folder on the WebDAV server, by the attachment's file name (in either Unicode form). A file that is not in the folder is looked for in Zotero's storage."),
+            radio = true,
+            checked_func = function() return ZoteroAPI.groupFiles(gid).mode == "webdav" end,
+            callback = function(touchmenu_instance)
+                local cfg = ZoteroAPI.groupFiles(gid)
+                if Dav.usable(cfg) then
+                    cfg.mode = "webdav"
+                    ZoteroAPI.setGroupFiles(gid, cfg)
+                    ZoteroAPI.saveSettingsToFile()
+                else
+                    self:editGroupDav(gid, name, function() if touchmenu_instance then touchmenu_instance:updateItems() end end)
+                end
+            end,
+        },
+        {
+            text = _("WebDAV folder…"),
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                self:editGroupDav(gid, name, function() if touchmenu_instance then touchmenu_instance:updateItems() end end)
+            end,
+        },
+        {
+            text = _("Test the WebDAV folder"),
+            enabled_func = function() return Dav.usable(ZoteroAPI.groupFiles(gid)) end,
+            keep_menu_open = true,
+            callback = function() self:testGroupDav(gid, name) end,
+        },
+    }
+end
+
+--- A long tap on a group in the browser.
+function Plugin:showGroupMenu(gid, name)
+    local dialog
+    local function rows()
+        local cfg = ZoteroAPI.groupFiles(gid)
+        return {
+            { { text = (ZoteroAPI.skippedGroups()[tostring(gid)] and "▢ " or "✓ ") .. _("Sync this group"), callback = function()
+                ZoteroAPI.setGroupSkipped(gid, not ZoteroAPI.skippedGroups()[tostring(gid)])
+                ZoteroAPI.saveSettingsToFile()
+                UIManager:close(dialog)
+            end } },
+            { { text = (cfg.mode ~= "webdav" and "◉ " or "○ ") .. _("Files from Zotero's storage"), callback = function()
+                cfg.mode = "zotero"; ZoteroAPI.setGroupFiles(gid, cfg); ZoteroAPI.saveSettingsToFile()
+                UIManager:close(dialog)
+            end } },
+            { { text = (cfg.mode == "webdav" and "◉ " or "○ ") .. _("Files from a shared WebDAV folder"), callback = function()
+                UIManager:close(dialog)
+                if Dav.usable(cfg) then
+                    cfg.mode = "webdav"; ZoteroAPI.setGroupFiles(gid, cfg); ZoteroAPI.saveSettingsToFile()
+                else
+                    self:editGroupDav(gid, name)
+                end
+            end } },
+            { { text = _("WebDAV folder…"), callback = function() UIManager:close(dialog); self:editGroupDav(gid, name) end } },
+        }
+    end
+    dialog = ButtonDialog:new({ title = name, buttons = rows() })
+    UIManager:show(dialog)
+end
+
+function Plugin:getGroupsMenu()
+    local items = {
+        {
+            text = _("Sync group libraries"),
+            help_text = _("The group libraries the API key may read are synced like your own library: their collections and entries in the browser, the annotations and reading positions of their documents. (The API key needs access to groups: zotero.org/settings/keys.)"),
+            checked_func = function() return ZoteroAPI.getSettings():readSetting("sync_groups") ~= false end,
+            callback = function()
+                local settings = ZoteroAPI.getSettings()
+                settings:saveSetting("sync_groups", settings:readSetting("sync_groups") == false)
+                ZoteroAPI.saveSettingsToFile()
+            end,
+            separator = true,
+        },
+    }
+    local groups = ZoteroAPI.knownGroups()
+    if #groups == 0 then
+        items[#items + 1] = { text = _("(No group libraries yet: they appear after the next sync.)"), enabled_func = function() return false end }
+    end
+    for __, g in ipairs(groups) do
+        items[#items + 1] = {
+            text_func = function()
+                local cfg = ZoteroAPI.groupFiles(g.id)
+                local note = ZoteroAPI.skippedGroups()[tostring(g.id)] and _("not synced") or (cfg.mode == "webdav" and _("files: WebDAV") or _("files: Zotero"))
+                return g.name .. " (" .. note .. ")"
+            end,
+            sub_item_table_func = function() return self:groupMenuItems(g.id, g.name) end,
+        }
+    end
+    return items
 end
 
 --- Colours changed: draw the open document's highlights again.
@@ -2042,6 +2711,7 @@ function Plugin:onZoteroBrowserAction()
     end
 
     self.browser:init()
+    browser_shown = self.browser
     UIManager:show(
         self.zotero_dialog,
         "full",
@@ -2051,27 +2721,40 @@ function Plugin:onZoteroBrowserAction()
         })
     )
     self.browser:displayCollection(nil)
+    updateIndicator()
+    -- and a sync, if the last one is a while ago
+    self:autoSync("the browser was opened", 600, 1)
 end
-function Plugin:onZoteroSyncAction()
+--- The full sync: libraries, annotations and reading positions of every
+-- document on this device, the files of offline collections; then, at most
+-- once a day, a look for a new version of the plugin.
+-- @param auto an automatic sync (quiet; the open document does not jump to
+--        Zotero's reading position under the reader's eyes)
+function Plugin:onZoteroSyncAction(auto)
     if not self:checkInitialized() then
         return
     end
+    auto = auto == true
     self:runSync(function(progress)
         progress("Synchronizing Zotero library.")
-        local open_ui = (self.ui and self.ui.document) and self.ui or nil
-        local e, summary = ZoteroAPI.syncAllItems(progress, {
+        local reader_changed = false
+        local e, lines, problems = ZoteroAPI.syncAllItems(progress, {
             -- runs after the library has been downloaded
             annotations = function(report)
-                local can_push = ZoteroAPI.canWrite()
-                if open_ui and not open_ui.document then open_ui = nil end -- closed meanwhile
                 local positions_sent, went = 0, nil
-                local done, problems, stats = AnnotationSync.all(report, open_ui,
-                    function(fn) self:guarded(fn) end, can_push,
-                    function(key, path, is_open)
+                local done, trouble, stats = AnnotationSync.all(report, currentReader, nil, true,
+                    function(key, path, is_open, reader)
                         -- reading positions travel with the same sync
-                        local result, page = Position.sync(open_ui, key, path, is_open, can_push)
+                        local can_push = ZoteroAPI.canWrite(key)
+                        local result, page
+                        if is_open and auto then
+                            if can_push then result = Position.pushOpen(reader, key) end
+                        else
+                            result, page = Position.sync(reader, key, path, is_open, can_push)
+                        end
                         went = page or went
                         if result == "sent" then positions_sent = positions_sent + 1 end
+                        return result
                     end)
                 if positions_sent > 0 then
                     done[#done + 1] = string.format(positions_sent == 1 and "Reading position of %d document sent to Zotero"
@@ -2080,39 +2763,41 @@ function Plugin:onZoteroSyncAction()
                 if went then
                     done[#done + 1] = string.format("Continued where Zotero was last read: page %s (Back returns)", tostring(went))
                 end
-                if open_ui and Sync.changedLocally(stats) then
-                    UIManager:setDirty(open_ui.dialog or "all", "ui")
+                if Sync.changedLocally(stats) then reader_changed = true end
+                if not ZoteroAPI.canWrite() and stats.pending > 0 then
+                    trouble[#trouble + 1] = "The API key is read-only: changes made here were not uploaded."
                 end
-                if not can_push and stats.pending > 0 then
-                    problems[#problems + 1] = "The API key is read-only: changes made here were not uploaded."
-                end
-                return done, problems
+                return done, trouble
             end,
         })
-
-        local lines = {}
-        if e == nil then
-            lines[#lines + 1] = "Success"
-        else
-            lines[#lines + 1] = readableStatus(e)
+        local report = { error = e, lines = lines or {}, problems = problems or 0, reader_changed = reader_changed }
+        -- (lines that say something happened; the rest are notes and problems)
+        local changes = 0
+        for __, l in ipairs(report.lines) do
+            if l:find("added") or l:find("updated") or l:find("sent") or l:find("deleted") or l:find("removed")
+                or l:find("downloaded") or l:find("moved") then changes = changes + 1 end
         end
-        for i = 1, #(summary or {}) do lines[#lines + 1] = summary[i] end
+        report.changes = changes
         -- a new version of the plugin, while the network is up
-        if e == nil then
+        if e == nil and not Bg.stopped() then
             local okc, note = pcall(self.autoUpdate, self, progress)
             if not okc then logger.warn("Zotero: update check failed:", tostring(note)) end
-            if okc and note then lines[#lines + 1] = note end
-        end
-        Trapper:info(table.concat(lines, "\n"))
-        if self.restart_for then
-            local version = self.restart_for
+            if okc and note then
+                table.insert(report.lines, note)
+                report.changes = report.changes + 1
+            end
+            report.restart_for = self.restart_for
             self.restart_for = nil
-            UIManager:nextTick(function() offerRestart(version) end)
         end
-    end)
+        return report
+    end, { auto = auto })
 end
 function Plugin:onZoteroReanalyzeAction()
     if not self:checkInitialized() then
+        return
+    end
+    if syncBusy() then
+        Notification:notify(_("A Zotero sync is running; try again when it has ended."), Notification.SOURCE_ALWAYS_SHOW)
         return
     end
     Trapper:wrap(function()
@@ -2132,6 +2817,10 @@ function Plugin:onZoteroReanalyzeAction()
 end
 function Plugin:onZoteroRescanAction()
     if not self:checkInitialized() then
+        return
+    end
+    if syncBusy() then
+        Notification:notify(_("A Zotero sync is running; try again when it has ended."), Notification.SOURCE_ALWAYS_SHOW)
         return
     end
     Trapper:wrap(function()

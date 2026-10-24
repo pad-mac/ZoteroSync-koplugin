@@ -1,8 +1,139 @@
 # Zotero Atelier — fork notes
 
 Source project: https://github.com/Atelier-Recherche/zoteroatelier.koplugin
-This fork: v0.12, 2026-10-24 (GPL-3.0, like the original).
+This fork: v0.13, 2026-10-24 (GPL-3.0, like the original).
 Repository and releases: https://github.com/pad-mac/ZoteroSync-koplugin
+
+## v0.13 — syncs in the background, faster; group libraries; sorting
+
+**Syncs run in the background.** The reader stays usable while a sync runs:
+a small box in a corner of the screen says what it is doing ("items 40%",
+"annotations 12/80", "files 3/20"), and a short note at the end says what
+came of it. Problems are kept in Zotero Atelier > Last sync report; after a
+sync you started yourself they are shown at once. Synchronize turns into
+"Stop the sync" while one runs. A sync that is over within a second shows
+no box at all.
+
+* Every request to Zotero is carried out by a short-lived child process
+  while the reader waits for nothing; requests that do not depend on each
+  other run four at a time. Work that must not be mixed with what you do -
+  a document's annotations are read, merged, uploaded and written back - is
+  done in one piece; between two documents the reader gets its turn.
+* The open document is always synced as it is at that moment: a highlight
+  made during a sync is kept and sent once (in that sync or the next), and a
+  document closed or opened during a sync is handled as what it then is.
+* **Automatic syncs** (Settings > Sync automatically, on by default), only
+  when the device is online already - Wi-Fi is never turned on for them: a
+  few seconds after a Zotero document is closed; when the Zotero browser is
+  opened and the last sync is ten minutes old; when Wi-Fi comes up or the
+  device wakes and it is half an hour old; when KOReader starts and it is an
+  hour old. An automatic sync never moves the open document to Zotero's
+  reading position (one you start does, as before).
+* Where the box sits: Settings > Sync indicator (default top right).
+
+**Faster.** Measured on a library of 600 entries, 300 documents on the
+device, 60 of them with 24 Zotero annotations each, 400 entries in an offline
+collection (50 of whose files are missing on the server) - a sync in which
+nothing changed:
+
+| | v0.12 | v0.13 |
+|---|---|---|
+| requests to Zotero | 54 | 2 |
+| documents' settings files read | 700 | 0 |
+| folders listed on the device | 37,550 | 0 |
+| time on a desktop computer (no network) | 1.9 s | 0.1 s |
+
+On the device each of these costs far more (a request is a new encrypted
+connection; a folder listing on Android's shared storage is slow), so the
+difference there is larger still. What changed:
+
+* One question per library tells whether anything changed at all; a library
+  where nothing did costs one request. What changed is fetched by key, 50
+  objects per request, four requests at a time.
+* A document in which nothing changed on either side since its last sync is
+  passed over: the state of its Zotero annotations, its reading position and
+  its settings file is noted after each complete sync and compared the next
+  time. (Maintenance > Look at every document at the next sync.)
+* A file the server does not have is not asked for at every sync any more:
+  only after its attachment changed in Zotero, or a day later.
+  (Maintenance > Try failed downloads again.)
+* Files are no longer searched for by name in Zotero's storage folders
+  before every download (they are in their attachment's folder or not
+  there); folders you set up for linked files are walked once per sync, not
+  once per file.
+* A file that is here is only noted in its document again (title, authors)
+  when its entry changed.
+
+**Downloads.** A file opened from the browser downloads in the background,
+with its progress in MB and a Cancel button; it opens when complete. The
+files of offline collections download two at a time. The file itself comes
+from Zotero's storage host without the API key (the redirect is followed by
+the plugin). A cancelled download leaves nothing behind. (The time a large
+PDF takes is set by the network: the reading of the data was measured at
+over 250 MB/s on a desktop, whatever the block size, so it is not what slows
+it down.)
+
+**Group libraries.** The groups your API key can read are synced like your
+own library: in the browser they come after your collections (two people
+for a picture), each with its collections, its unfiled entries and its
+All Items; search covers every library. Annotations and reading positions of
+group documents sync both ways (positions as Zotero keeps them for groups,
+lastPageIndex_g<group>_<key>); uploads go to the group. A group in which
+only admins may edit is read-only for a member: changes made here wait, and
+the sync says so.
+
+* Settings > Group libraries: groups on or off as a whole; per group: sync
+  it or leave it out (its entries are then removed from the device; files
+  and your annotations in them stay), and where its files come from.
+* **Files from a shared WebDAV folder, as Group Linked Files keeps them**
+  (github.com/pad-mac/Zotero-Group-Linked-Files): server (default HU-Box,
+  https://box.hu-berlin.de/huboxdav/), folder, user name and WebDAV
+  password, as set in Zotero; "Test the WebDAV folder" counts its files.
+  Each file is looked up in the folder's listing by the attachment's file
+  name, in either Unicode form ("ü" as one character or as "u" with a
+  combining mark), and downloaded into the attachment's own folder on the
+  device. A file the folder does not have is looked for in Zotero's
+  storage. A long tap on a group in the browser offers the same settings.
+* Groups that are renamed in Zotero are renamed here; groups you leave (or
+  the key may no longer read) are removed from the device.
+* When files of a group are missing in Zotero's storage, the sync report
+  points to that setting.
+
+**Sorting in the browser.** The browser has a sort button beside the search
+button: date added (the default, newest first), date modified, author,
+title; choosing the checked one again reverses the order. The choice is
+kept. Collections stay first, by name. (The order used to be the order in
+which entries had been stored here: new ones ended up at the bottom.)
+Author is the first author (or editor), without regard to accents and case;
+entries without one come last.
+
+**Sync button in the browser** beside the close button: a tap syncs; while
+a sync runs the button shows a small square and the line under the title
+says what the sync is doing, and a tap offers to stop it. A long tap shows
+the last sync report.
+
+Tested: every earlier suite (1,400 checks) adapted to background syncs, plus
+group libraries against the mock server (101 checks: collections and
+entries per library, writes to the right library, read-only groups, group
+positions, the storage redirect without the key, WebDAV folder with both
+Unicode forms, wrong password, fallback, groups left, renamed, gone, the
+hint to set up the WebDAV folder, and the browser's order), the child-process transport against a mock server in its own
+process with 0.3 s latency and throttled transfers (30 checks: a first sync
+of 800 items in 3.4 s with requests overlapping against 7.4 s one after the
+other, the reader held up for about a tenth of a second at most against
+2.5 s; six files of 6.3 MB in 5.3 s against 8.1 s one after the other,
+intact; a cancelled download stops at once and leaves nothing; a child
+process that dies is replaced by the request made in the reader), syncs
+while the user reads and
+highlights (23 checks), and the browser's buttons, group rows, sort dialog,
+sync state and the corner box, painted at the Leaf2's resolution (34
+checks).
+
+Not tested on a device: the child processes use the same mechanism as
+KOReader's own Wikipedia and translation lookups, which run on Android, but
+this has not been seen on the Leaf2 yet. Should a child process end without
+an answer there, the plugin makes that request in the reader instead, and
+after the second time all of them (logged in crash.log).
 
 ## v0.12 — updates from GitHub
 

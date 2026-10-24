@@ -3,12 +3,18 @@
 A KOReader plugin that keeps your Zotero library and KOReader in step:
 
 - **Annotations both ways** for PDFs, EPUBs and web snapshots: highlights and
-  underlines with their colours and comments, edits and deletions. Nothing is
-  sent to Zotero without a sync you start.
+  underlines with their colours and comments, edits and deletions.
+- **Syncs in the background** while you read, with a small indicator in a
+  corner; automatic syncs (after closing a Zotero document, when Wi-Fi comes
+  up, …) when the device is online anyway; can be switched off.
+- **Group libraries**, including groups whose files are kept in a shared
+  WebDAV folder with the Zotero plugin
+  [Group Linked Files](https://github.com/pad-mac/Zotero-Group-Linked-Files).
 - **Reading position**: a document opens where Zotero last was; a sync sends
   the place reached in KOReader.
 - **Collection browser** with the download state of every file, offline
-  collections, search.
+  collections, search, sorting (date added, date modified, author, title) and
+  a sync button; files download in the background with their progress.
 - Zotero's highlight colours in the reader, readable on grey e-ink screens;
   a "Discard" button in the colour popup after a selection; a KOReader
   profile per kind of document.
@@ -27,7 +33,8 @@ What changed in each version, what was tested and what the limits are:
 3. Restart KOReader. The plugin is in the top menu, in the search tab (the
    magnifying glass) and under Tools: Zotero Atelier.
 4. Zotero Atelier > Settings > Configure Zotero account: your Zotero user ID
-   and an API key with write access (both at https://www.zotero.org/settings/keys).
+   and an API key with write access (both at https://www.zotero.org/settings/keys;
+   give the key access to your groups too if they are to be synced).
 
 ## Updates
 

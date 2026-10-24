@@ -8,6 +8,11 @@ band left empty, when it would have to be downloaded first.
 A collection: a folder. Filled, with an arrow pointing down, when the
 collection is one of those whose files a sync downloads.
 
+A group library: two people.
+
+The buttons of the browser's title bar (sync, sort) are pictures in the
+style of the reader's own icons, written once as files (Icons.svg).
+
 They are drawn with rectangles, not taken from a font or from picture files:
 the same on every device and at every size, and sharp on an e-ink screen.
 
@@ -105,6 +110,41 @@ local function paint_file(self, bb, x, y)
     label:free()
 end
 
+--- A filled disc (radius r, centre cx, cy), drawn row by row.
+local function disc(bb, cx, cy, r, color)
+    for dy = -r, r do
+        local half = math.floor(math.sqrt(math.max(0, r * r - dy * dy)) + 0.5)
+        if half > 0 then bb:paintRect(cx - half, cy + dy, 2 * half, 1, color) end
+    end
+end
+--- Head and shoulders, `size` high, its top at y.
+local function person(bb, cx, y, size, color, grow)
+    grow = grow or 0
+    local r = math.floor(size * 0.22) + grow
+    disc(bb, cx, y + r, r, color)
+    local top = y + math.floor(size * 0.50) - grow
+    local half_w = math.floor(size * 0.38) + grow
+    local h = y + size - top + grow
+    for row = 0, h - 1 do
+        -- the upper half of an ellipse: shoulders
+        local t = 1 - row / h
+        local half = math.floor(half_w * math.sqrt(math.max(0, 1 - t * t)) + 0.5)
+        if half > 0 then bb:paintRect(cx - half, top + row, 2 * half, 1, color) end
+    end
+end
+
+local function paint_group(self, bb, x, y)
+    local m = self.metrics
+    local size = math.floor(m.h * 0.80)
+    local top = y + math.floor((m.h - size) / 2)
+    local cx = x + math.floor(m.w / 2)
+    local back_size = math.floor(size * 0.82)
+    -- the one behind, then the one in front with a white rim between them
+    person(bb, cx + math.floor(size * 0.26), top, back_size, BLACK)
+    person(bb, cx - math.floor(size * 0.12), top + size - back_size - math.floor(size * 0.0), size, WHITE, 2 * m.line)
+    person(bb, cx - math.floor(size * 0.12), top + size - back_size - math.floor(size * 0.0), size, BLACK)
+end
+
 local function paint_folder(self, bb, x, y)
     local m = self.metrics
     local t = m.line
@@ -141,6 +181,8 @@ function Picture:paintTo(bb, x, y)
     self.dimen = Geom:new{ x = x, y = y, w = self.metrics.w, h = self.metrics.h }
     if self.what == "folder" then
         paint_folder(self, bb, x, y)
+    elseif self.what == "group" then
+        paint_group(self, bb, x, y)
     else
         paint_file(self, bb, x, y)
     end
@@ -155,6 +197,45 @@ end
 --- @param downloads is this a collection whose files a sync downloads?
 function Icons.folder(metrics, downloads)
     return Picture:new{ metrics = metrics, what = "folder", filled = downloads and true or false }
+end
+
+--- A group library.
+function Icons.group(metrics)
+    return Picture:new{ metrics = metrics, what = "group" }
+end
+
+-- ---------------------------------------------------------------------------
+-- Pictures for buttons, as SVG files
+-- ---------------------------------------------------------------------------
+
+local SVG = {
+    ["zotero.sync"] = [[<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48"><path style="fill:none;stroke:#000000;stroke-width:2;stroke-linecap:round;stroke-linejoin:round" d="M 36.80 21.74 A 13 13 0 0 0 11.44 20.64 M 11.20 26.26 A 13 13 0 0 0 36.56 27.36 M 15.84 17.33 L 11.44 20.64 L 9.29 15.57 M 32.16 30.67 L 36.56 27.36 L 38.71 32.43"/></svg>]],
+    ["zotero.sync.busy"] = [[<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48"><path style="fill:none;stroke:#000000;stroke-width:2;stroke-linecap:round;stroke-linejoin:round" d="M 36.80 21.74 A 13 13 0 0 0 11.44 20.64 M 11.20 26.26 A 13 13 0 0 0 36.56 27.36 M 15.84 17.33 L 11.44 20.64 L 9.29 15.57 M 32.16 30.67 L 36.56 27.36 L 38.71 32.43"/><rect x="20" y="20" width="8" height="8" style="fill:#000000;stroke:none"/></svg>]],
+    ["zotero.sort"] = [[<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48"><path style="fill:none;stroke:#000000;stroke-width:2;stroke-linecap:round;stroke-linejoin:round" d="M 7 13 L 29 13 M 7 24 L 24 24 M 7 35 L 19 35 M 37 9 L 37 38 M 40.86 33.40 L 37.00 38.00 L 33.14 33.40"/></svg>]],
+}
+
+--- The file of a button picture ("zotero.sync", "zotero.sync.busy",
+-- "zotero.sort"), written into `dir` if it is not there as it should be.
+-- @return its path, or nil
+function Icons.svg(name, dir)
+    local content = SVG[name]
+    if not content or not dir then return nil end
+    local lfs = require("libs/libkoreader-lfs")
+    if lfs.attributes(dir, "mode") ~= "directory" then lfs.mkdir(dir) end
+    local path = dir .. "/" .. name .. ".svg"
+    local f = io.open(path, "rb")
+    local have = f and f:read("*a")
+    if f then f:close() end
+    if have ~= content then
+        f = io.open(path, "wb")
+        if not f then return nil end
+        f:write(content)
+        f:close()
+    end
+    return path
 end
 
 return Icons

@@ -129,6 +129,22 @@ local function get_file(url, path)
     return code, err
 end
 
+--- In a background job of the plugin (zotero_bg.lua) a transfer runs in a
+-- child process, and the reader stays usable meanwhile.
+local function off_thread(fn)
+    return function(...)
+        local okb, Bg = pcall(require, "zotero_bg")
+        if okb and type(Bg) == "table" and Bg.current and Bg.current() then
+            local res = Bg.call(function(...) return table.pack(fn(...)) end, ...)
+            if res.n == nil then return nil, res.err or "no answer" end
+            return unpack(res, 1, res.n)
+        end
+        return fn(...)
+    end
+end
+get_text = off_thread(get_text)
+get_file = off_thread(get_file)
+
 --- The latest release. @return { version, tag, url, size, digest, notes, page }   or nil, reason
 function Update.latest()
     local code, body = get_text("https://api.github.com/repos/" .. Update.REPO .. "/releases/latest",

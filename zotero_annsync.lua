@@ -10,14 +10,72 @@ This is the only place that ties together the three parts:
 ]]
 
 local Annotations = require("annotations")
+local Bg = require("zotero_bg")
 local Doc = require("zotero_doc")
 local DocSettings = require("docsettings")
 local Sync = require("zotero_sync")
 local ZoteroAPI = require("zoteroapi")
 local lfs = require("libs/libkoreader-lfs")
 local logger = require("logger")
+local sha2 = require("ffi/sha2")
 
 local Run = { fork = "0.6" }
+
+-- ---------------------------------------------------------------------------
+-- A document neither side changed since its last complete sync is not looked
+-- at again: what both sides were then is noted (the state of Zotero's
+-- annotations of the attachment and of its reading position; the size and
+-- time of the document's settings file, which holds its annotations and the
+-- place it was read to), and compared at the next sync.
+-- ---------------------------------------------------------------------------
+
+-- (a new version of the plugin looks at every document once more)
+local FINGERPRINT = "1:" .. tostring(ZoteroAPI.version)
+
+local function remote_fingerprint(key)
+    local list = ZoteroAPI.annotationVersions(key)
+    local pos, pver = ZoteroAPI.getRemotePosition(key)
+    -- (and whether reading positions are synced at all)
+    local settings = ZoteroAPI.getSettings()
+    local positions = settings and settings:readSetting("sync_reading_position") ~= false
+    return sha2.md5(FINGERPRINT .. "|" .. tostring(positions) .. "|" .. list .. "|" .. tostring(pos) .. "@" .. tostring(pver))
+end
+
+--- @return the fingerprint, and the file's time (nil: no settings file)
+local function local_fingerprint(path)
+    local file = DocSettings:findSidecarFile(path)
+    if not file then return "none|" .. tostring(path) end
+    local a = lfs.attributes(file) or {}
+    return string.format("%s|%s|%s", file, tostring(a.modification), tostring(a.size)), tonumber(a.modification)
+end
+
+--- Has nothing changed on either side since the last complete sync?
+-- (File times count in whole seconds: a settings file written in the second
+-- its state was noted could have been written again unseen. Its note is not
+-- trusted; the document is looked at once more.)
+function Run.unchanged(key, path)
+    local st = ZoteroAPI.attachmentState(key)
+    if not st.annLocal or not st.annRemote then return false end
+    local fp, noted_at = st.annLocal:match("^(.*)|@(%d+)$")
+    noted_at = tonumber(noted_at)
+    if not fp or not noted_at then return false end
+    local now, mtime = local_fingerprint(path)
+    if now ~= fp then return false end
+    if mtime and mtime >= noted_at - 1 then return false end
+    return st.annRemote == remote_fingerprint(key)
+end
+
+--- Note both sides as they are now (after a sync that left nothing to do).
+function Run.noteSynced(key, path)
+    ZoteroAPI.setAttachmentState(key, { annLocal = local_fingerprint(path) .. "|@" .. os.time(), annRemote = remote_fingerprint(key) })
+end
+function Run.forgetSynced(key)
+    ZoteroAPI.setAttachmentState(key, { annLocal = false, annRemote = false })
+end
+
+local function settled(stats)
+    return stats ~= nil and stats.pending == 0 and stats.failed == 0 and stats.conflicts == 0
+end
 
 local remote_api = {
     write = function(objects) return ZoteroAPI.writeObjects(objects) end,
@@ -159,29 +217,52 @@ function Run.openDocument(ui, guard, opts)
     return stats, removed + restored
 end
 
+--- The document open in the reader now (it may change while a sync runs in
+-- the background), with a guard for changes made to it.
+local function open_reader(ui)
+    if type(ui) == "function" then ui = ui() end
+    if not ui or not ui.document or not ui.document.file then return nil end
+    return ui
+end
+local function guard_of(ui, guard)
+    if type(guard) == "function" then return guard end
+    local plugin = ui and ui.zoteroatelier
+    if plugin and plugin.guarded then return function(fn) return plugin:guarded(fn) end end
+    return nil
+end
+
 --- Sync the annotations of every attachment that is on this device.
--- @param progress  function(message)
--- @param ui        the ReaderUI if a document is open (it is synced live;
---                  its sidecar file is never written behind the reader's back)
--- @param each      optional function(key, path, is_open), called for every
---                  attachment whose document is on this device
+-- Each document is one piece of work that nothing the user does can come in
+-- between (zotero_bg: a critical section); between two documents the reader
+-- gets its turn, and the sync can be stopped.
+-- @param progress  function(message, fraction) -> false to stop
+-- @param ui        the ReaderUI if a document is open, or a function that
+--                  returns the one open now (it is synced live; its sidecar
+--                  file is never written behind the reader's back)
+-- @param guard     function(fn) for changes to the open document (default:
+--                  that reader's plugin's)
+-- @param push      upload local changes (where the key may write)
+-- @param each      optional function(key, path, is_open) -> result, called for
+--                  every attachment whose document is on this device (the
+--                  reading position); a result "failed" counts as unsettled
 -- @return summary lines, problem lines, stats
 function Run.all(progress, ui, guard, push, each)
     progress = progress or function() end
-    local function visit(key, path, is_open)
-        if not each then return end
-        local ok, err = pcall(each, key, path, is_open)
-        if not ok then logger.warn("Zotero: per-document step failed for", path, tostring(err)) end
+    local function visit(key, path, is_open, reader)
+        if not each then return nil end
+        local ok, res = pcall(each, key, path, is_open, reader)
+        if not ok then logger.warn("Zotero: per-document step failed for", path, tostring(res)); return "failed" end
+        return res
     end
     local total = Sync.newStats()
-    local open_file = ui and ui.document and ui.document.file or nil
     local open_done = false
     local list = ZoteroAPI.getLocalAttachments()
-    local errors, shared = 0, 0
+    local errors, shared, skipped, read_only = 0, 0, 0, 0
     local stopped = false
-    for i, entry in ipairs(list) do
+    ZoteroAPI.beginFileIndex()
+    local function one(entry, i)
         local item = entry.item
-        local path = ZoteroAPI.resolveAttachmentPath(item)
+        local path = ZoteroAPI.resolveAttachmentPath(item, true) or ZoteroAPI.resolveAttachmentPath(item)
         if not path then
             local _, p = ZoteroAPI.getDirAndPath(item)
             if p and lfs.attributes(p, "mode") == "file" then path = p end
@@ -195,41 +276,74 @@ function Run.all(progress, ui, guard, push, each)
             shared = shared + 1
             path = nil
         end
-        if path and kind_of(path) then
-            local is_open = open_file ~= nil and ZoteroAPI.pathsEqual(path, open_file)
-            -- nothing to do for a document that has no annotations on either side
-            local has_remote = next((ZoteroAPI.getAttachmentAnnotations(entry.key))) ~= nil
-            if is_open or has_remote or DocSettings:hasSidecarFile(path) then
-                if progress(string.format("Syncing annotations %d/%d", i, #list)) == false then
-                    stopped = true
-                    break
-                end
-                local stats, err
-                if is_open then
-                    open_done = true
-                    stats, err = Run.attachment(entry.key, path, { ui = ui, guard = guard, push = push })
-                else
-                    stats, err = Run.attachment(entry.key, path, { push = push })
-                end
-                if stats then
-                    Sync.addStats(total, stats)
-                else
-                    errors = errors + 1
-                    logger.warn("Zotero: annotation sync failed for", path, tostring(err))
-                end
+        if not (path and kind_of(path)) then return end
+        local reader = open_reader(ui)
+        local is_open = reader ~= nil and ZoteroAPI.pathsEqual(path, reader.document.file)
+        if not is_open and Run.unchanged(entry.key, path) then
+            skipped = skipped + 1
+            return
+        end
+        -- nothing to do for a document that has no annotations on either side
+        -- (and no settings file is made for one that was never opened here)
+        if not is_open and ZoteroAPI.annotationVersions(entry.key) == "" and not DocSettings:hasSidecarFile(path) then
+            visit(entry.key, path, false, reader)
+            return
+        end
+        local can_push = push and ZoteroAPI.canWrite(entry.key)
+        local stats, err
+        if is_open then
+            open_done = true
+            stats, err = Run.attachment(entry.key, path, { ui = reader, guard = guard_of(reader, guard), push = can_push })
+        else
+            stats, err = Run.attachment(entry.key, path, { push = can_push })
+        end
+        local held = false
+        if stats then
+            if push and not can_push and stats.pending > 0 then
+                -- (a library this key may only read: the document is looked
+                -- at again next time)
+                held = true
+                if ZoteroAPI.libraryOfKey(entry.key).type == "group" then read_only = read_only + stats.pending end
             end
-            visit(entry.key, path, is_open)
+            Sync.addStats(total, stats)
+        else
+            errors = errors + 1
+            logger.warn("Zotero: annotation sync failed for", path, tostring(err))
+        end
+        local result = visit(entry.key, path, is_open, reader)
+        if not is_open then
+            if settled(stats) and not held and result ~= "failed" then
+                Run.noteSynced(entry.key, path)
+            else
+                Run.forgetSynced(entry.key)
+            end
         end
     end
-    -- the open document, when it was not in the list (opened from outside the plugin)
-    if ui and not open_done and not stopped then
-        local key, file_path = Run.identify(ui)
-        if key and kind_of(file_path) then
-            pcall(ZoteroAPI.markAttachmentPresent, key)
-            local stats = Run.attachment(key, file_path, { ui = ui, guard = guard, push = push })
-            if stats then Sync.addStats(total, stats) end
-            visit(key, file_path, true)
+    local ok, perr = pcall(function()
+        for i, entry in ipairs(list) do
+            if progress(string.format("Syncing annotations %d/%d", i, #list), #list > 0 and i / #list or nil) == false or Bg.stopped() then
+                stopped = true
+                break
+            end
+            Bg.critical(one, entry, i)
         end
+    end)
+    ZoteroAPI.endFileIndex()
+    if not ok then error(perr, 0) end
+    -- the open document, when it was not in the list (opened from outside the plugin)
+    local reader = open_reader(ui)
+    if reader and not open_done and not stopped then
+        Bg.critical(function()
+            reader = open_reader(ui)
+            if not reader then return end
+            local key, file_path = Run.identify(reader)
+            if key and kind_of(file_path) then
+                pcall(ZoteroAPI.markAttachmentPresent, key)
+                local stats = Run.attachment(key, file_path, { ui = reader, guard = guard_of(reader, guard), push = push and ZoteroAPI.canWrite(key) })
+                if stats then Sync.addStats(total, stats) end
+                visit(key, file_path, true, reader)
+            end
+        end)
     end
     local done, problems = Sync.summary(total)
     if errors > 0 then
@@ -238,7 +352,12 @@ function Run.all(progress, ui, guard, push, each)
     if shared > 0 then
         problems[#problems + 1] = string.format("%d document(s) skipped: several Zotero attachments have a file of the same name (see crash.log)", shared)
     end
-    logger.info("Zotero: annotation sync finished:", table.concat(done, "; "), "|", table.concat(problems, "; "))
+    if read_only > 0 then
+        problems[#problems + 1] = string.format("%d change(s) in group libraries not uploaded: the API key (or your role in the group) does not allow writing there", read_only)
+    end
+    total.skipped_unchanged = skipped
+    total.stopped = stopped
+    logger.info("Zotero: annotation sync finished:", table.concat(done, "; "), "|", table.concat(problems, "; "), "|", skipped, "unchanged documents skipped")
     return done, problems, total
 end
 
