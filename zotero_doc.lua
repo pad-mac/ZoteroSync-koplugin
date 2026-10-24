@@ -17,6 +17,7 @@ Both list types offer the same small interface to zotero_sync:
 local Annotations = require("annotations")
 local DocSettings = require("docsettings")
 local Epub = require("zotero_epub")
+local Html = require("zotero_html")
 local Event = require("ui/event")
 local Util = require("zotero_util")
 local logger = require("logger")
@@ -419,10 +420,11 @@ function Doc.pdfConverter(file_path, document, remote_items)
     return conv
 end
 
---- EPUB. Positions can only be converted while the book is open in the
--- reader (the conversion needs crengine's rendered document).
+--- EPUB and web snapshots. Positions can only be converted while the
+-- document is open in the reader (the conversion needs crengine's tree).
 -- @param document the open CreDocument, or nil
-function Doc.epubConverter(document)
+-- @param kind     "epub" (default) or "html"
+function Doc.epubConverter(document, kind)
     if not document then
         return {
             available = false,
@@ -432,14 +434,14 @@ function Doc.epubConverter(document)
             close = function() end,
         }
     end
-    local session = Epub.newSession(document)
+    local session = kind == "html" and Html.newSession(document) or Epub.newSession(document)
     local conv = { available = true }
 
     function conv.to_local(item)
         local d = item.data or {}
         local ok, xp0, xp1, how = pcall(session.fromZotero, session, d.annotationPosition, d.annotationText, d.annotationSortIndex)
         if not ok then
-            logger.warn("Zotero: EPUB annotation conversion failed:", tostring(xp0))
+            logger.warn("Zotero: annotation conversion failed:", tostring(xp0))
             return nil, "conversion error"
         end
         if not xp0 then return nil, xp1 end
@@ -458,11 +460,11 @@ function Doc.epubConverter(document)
 
     function conv.to_remote(ann)
         if type(ann.pos0) ~= "string" or type(ann.pos1) ~= "string" then
-            return nil, "not an EPUB highlight"
+            return nil, "not a text highlight"
         end
         local ok, res, err = pcall(session.toZotero, session, ann.pos0, ann.pos1)
         if not ok then
-            logger.warn("Zotero: EPUB position conversion failed:", tostring(res))
+            logger.warn("Zotero: position conversion failed:", tostring(res))
             return nil, "conversion error"
         end
         return res, err
@@ -491,7 +493,7 @@ end
 -- have to be uploaded, while the book is open. A later sync can then send
 -- them without opening the book.
 -- @return number of positions stored
-function Doc.cacheEpubPositions(ui)
+function Doc.cacheEpubPositions(ui, kind)
     if not ui or not ui.rolling or not ui.annotation then return 0 end
     local conv
     local n = 0
@@ -506,7 +508,7 @@ function Doc.cacheEpubPositions(ui)
                 needs = base.pos ~= Annotations.localFields(ann).pos -- moved since the last sync
             end
             if needs and not (type(ann.zoteroPos) == "table" and ann.zoteroPos.sig == sig) then
-                conv = conv or Doc.epubConverter(ui.document)
+                conv = conv or Doc.epubConverter(ui.document, kind)
                 local res = conv.to_remote(ann)
                 if res then
                     ann.zoteroPos = { sig = sig, position = res.position, sortIndex = res.sortIndex, pageLabel = res.pageLabel }

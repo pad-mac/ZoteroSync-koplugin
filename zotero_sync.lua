@@ -115,7 +115,8 @@ function Sync.summary(stats)
     warn(stats.failed, "%d upload was refused by Zotero", "%d uploads were refused by Zotero")
     warn(stats.conflicts, "%d change will be merged at the next sync (edited in Zotero meanwhile)", "%d changes will be merged at the next sync (edited in Zotero meanwhile)")
     warn(stats.pending, "%d change has not been uploaded yet", "%d changes have not been uploaded yet")
-    warn(stats.deferred, "%d EPUB annotation will be completed when the book is opened", "%d EPUB annotations will be completed when the book is opened")
+    warn(stats.deferred, "%d annotation of an EPUB or web snapshot will be completed when the document is opened",
+        "%d annotations of EPUBs or web snapshots will be completed when the document is opened")
     return parts, problems
 end
 
@@ -329,7 +330,7 @@ local function same_highlight(env, ann, pos, item)
     local a, b = Util.normText(ann.text or ""), Util.normText(d.annotationText or "")
     if a == "" or a ~= b then return false end
     if pos.position == d.annotationPosition then return true end
-    if env.kind == "epub" then
+    if env.kind ~= "pdf" then
         return pos.sortIndex == d.annotationSortIndex
     end
     -- PDF: same page, and about the same height on it
@@ -707,7 +708,8 @@ function Sync.reconcile(env)
                 ann.zoteroSync = { l = Annotations.localFields(ann), r = Annotations.remoteFields(item) }
                 env.list:add(ann)
                 stats.imported = stats.imported + 1
-                if how == "text" or how == "geometry-unverified" or how == "cfi-unverified" or how == "rects" then
+                if how == "text" or how == "geometry-unverified" or how == "cfi-unverified" or how == "rects"
+                    or how == "position-unverified" then
                     logger.info("Zotero sync: annotation", item.key, "placed by", how)
                 end
             else
@@ -715,7 +717,9 @@ function Sync.reconcile(env)
                 local d = item.data or {}
                 local where
                 local head = sort_index_head(d.annotationSortIndex)
-                if env.kind == "epub" then
+                if env.kind == "html" then
+                    where = "in the page"
+                elseif env.kind == "epub" then
                     where = head and string.format("in part %d of the book", head + 1) or "in the book"
                 elseif d.annotationPageLabel and d.annotationPageLabel ~= "" then
                     where = "on page " .. tostring(d.annotationPageLabel)

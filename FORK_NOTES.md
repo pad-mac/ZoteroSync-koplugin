@@ -1,7 +1,224 @@
 # Zotero Atelier — fork notes
 
 Source project: https://github.com/Atelier-Recherche/zoteroatelier.koplugin
-This fork: v0.8.1, 2026-10-03 (GPL-3.0, like the original).
+This fork: v0.12, 2026-10-24 (GPL-3.0, like the original).
+Repository and releases: https://github.com/pad-mac/ZoteroSync-koplugin
+
+## v0.12 — updates from GitHub
+
+The plugin now updates itself from the releases of
+https://github.com/pad-mac/ZoteroSync-koplugin.
+
+* **Automatically after a sync**, at most once a day: when the device is
+  online for the sync anyway (Wi-Fi is never turned on for this), the plugin
+  asks GitHub for the latest release and, if it is newer, installs it. The
+  sync's summary says so and a restart is offered: the new version runs after
+  KOReader has been restarted. If GitHub cannot be reached, nothing is said.
+* **By hand:** Zotero Atelier > Updates > Check for updates. It shows the
+  release notes and asks before installing.
+* **Nothing is replaced unless the whole update checks out:** the download
+  must be complete and match the SHA-256 checksum GitHub lists for it; it
+  must contain the plugin's folder with its main files; every Lua file must
+  compile; and the version inside must be the release's. Each file is then
+  written beside the old one and renamed over it; should that fail half-way,
+  the files already replaced are put back.
+* **The version it replaces is kept.** Updates > Restore the previous version
+  puts it back; automatic updates then leave out the version that was taken
+  out until a newer one is published.
+* Automatic updates can be switched off: Updates > Install updates
+  automatically.
+
+Publishing: a tag `v0.13` pushed to the repository makes a GitHub workflow
+check the version in `zoteroapi.lua` against the tag, compile every Lua file,
+package `zoteroatelier.koplugin.zip` and publish it as a release, with the
+section of these notes for that version as release notes.
+
+## v0.11 — "Discard" in the popup after a selection
+
+With KOReader set to highlight a selection at once and to ask for the colour
+(Long-press on text: "Highlight action: Highlight", "Highlight prompt:
+color", or style, or both), lifting the finger brings up a list of colours.
+Everything one can do there makes a highlight - a tap on a colour, and a tap
+beside the list too (it takes the current colour) - so a selection that went
+wrong had to be highlighted first and then deleted through the highlight's
+own dialog.
+
+The list now has one more row at the bottom, **Discard**: the selection is
+dropped, nothing is highlighted, and the passage can be selected again right
+away. The same row is in the list of styles, and in the list that follows
+"Highlight" or "Add note" in the reader's selection menu. A tap beside the
+list still highlights in the current colour, as before.
+
+* It is KOReader's popup, so this applies to every document, not only to
+  Zotero's. It can be switched off: Settings > "Discard" in the popup after
+  selecting text.
+* The list remains KOReader's own widget with a row added. Should a future
+  KOReader build its popup differently, the plugin leaves it alone (the
+  setting is then greyed out), and if adding the row fails, KOReader's own
+  popup comes up: highlighting is never blocked by this.
+* Done in the plugin rather than as a KOReader user patch: one thing to
+  install, a setting to switch it off, and covered by the plugin's tests.
+* A highlight that was already made (a colour was tapped) is removed as
+  before: tap the highlight, Delete.
+
+## v0.10 — a profile per kind of document, and a clearer browser
+
+**Profile per kind of document** (Settings). For PDFs, EPUBs and web
+snapshots one of KOReader's profiles can be chosen each; its settings (font,
+font size, margins, line spacing, zoom, contrast, whatever the profile
+holds) are applied when a Zotero document of that kind is opened.
+
+* Profiles are KOReader's own: Tools > Profiles. The quickest way to make
+  one is to open a document of the kind, set it up as it should look, and
+  choose "New with current book settings" there.
+* Only documents that belong to Zotero are touched; other books keep to
+  KOReader's rules (which has its own "auto-execute on book opening" for
+  those).
+* A document takes the profile once, and again after the profile has been
+  changed or another one chosen. What is adjusted in a single document in
+  between stays: the profile sets the starting point for a kind, it does not
+  undo changes at every opening.
+* A profile that was deleted or renamed in KOReader is shown as such in the
+  menu and nothing is applied. It also works with KOReader's Profiles plugin
+  switched off (the profiles are read from its file).
+
+**The browser.**
+
+* Collections are set in bold, with a folder in front, and no longer end in
+  "/". The path under the title is written `/Collection/Sub-collection`.
+* A collection that is set to "Download this collection during sync" has a
+  filled folder with an arrow pointing down. Long-pressing a collection and
+  changing the setting updates the folder at once.
+* An entry shows the kind of file a tap on it opens (PDF, EPUB, WEB for a
+  snapshot; the same order of preference as the tap): black with a filled
+  band when the file is on this device, grey with an empty band when it has
+  to be downloaded first. An entry with several files of that kind is black
+  only if all of them are there; a copy that is older than Zotero's counts
+  as not there, because opening it downloads the new one. Entries with
+  nothing to open here (links only, no attachment) have no picture.
+* The pictures are drawn by the plugin, not taken from a font or image
+  files, and sized by the list's text; they are looked up only for the rows
+  of the page shown, so large collections open as fast as before.
+* The files, links and notes of entries are no longer listed as rows of
+  their own at the top level and in "All Items" (they have no collection, and
+  the top level showed every one of them after the collections). A file that
+  is an entry of its own is still listed.
+* "All Items" is one level below the top (one Return leads back; it used to
+  take two, with an empty page in between), and Return after two searches in
+  a row goes back to the first.
+
+## v0.9 — annotations in web snapshots
+
+Highlights and underlines now sync in both directions for the HTML snapshots
+Zotero saves of web pages, with the same rules as for PDF and EPUB (colours,
+comments, edits, deletions, the delete log, nothing sent without a sync you
+start).
+
+**How Zotero addresses a place in a snapshot.** Not by its text: by a CSS
+selector for an element plus character offsets counted over that element's
+text nodes (`{"type":"CssSelector","value":"#content > p:nth-child(3)",
+"refinedBy":{"type":"TextPositionSelector","start":12,"end":40}}`), in the
+document tree Zotero's reader builds: the file read as UTF-8 by an HTML5
+parser, `<base>`, `<noscript>` and content-security `<meta>` removed, written
+out and parsed a second time. KOReader has another parser, another tree and
+no CSS selectors. So the plugin carries its own HTML5 parser
+(`zotero_htmlparse.lua`, with the full entity table) to build Zotero's tree
+from the file, a small selector engine to resolve and to write selectors the
+way Zotero does, and matches that tree with KOReader's by text.
+
+**Nothing is guessed.** A place is carried from one tree to the other only
+through text that occurs exactly once in both (the window is grown until it
+does). Going to Zotero, the result is carried back and must be the selection
+again, and the written position must resolve to it. Coming from Zotero, the
+passage found must carry the annotation's own text (short texts exactly), and
+is checked in the open document before it is stored; a position whose text
+is not there is looked for by its text near the place Zotero's sort index
+names, and otherwise the annotation is left in Zotero and reported as not
+placed. A selection that cannot be carried with certainty is not uploaded,
+and says why.
+
+**Snapshots are prepared for KOReader's engine.** KOReader's HTML parser
+ends a tag at the first `>`, even inside a quoted attribute value. Saved
+pages are full of such values: SingleFile, which Zotero uses, writes the
+document of every frame into `srcdoc="<html>..."`, and pages carry pictures
+and tooltips as markup in attributes. KOReader then shows attribute text as
+page text, or, after a frame, nothing more of the page. The plugin therefore
+rewrites *its own copy* of a snapshot once: `>` inside attribute values
+becomes `&gt;` (the same value to every HTML parser) and the inline documents
+of frames are emptied (KOReader does not display frames). Before the copy is
+used it is parsed again and must give the same tree as the original, so
+Zotero's positions mean the same in both. This happens when a snapshot is
+downloaded, when an entry is opened from the Zotero browser, and - once, with
+the page being opened again - when a snapshot stored by an earlier version is
+opened from KOReader's history. Never rewritten: linked files, files in
+Zotero's own storage folder (external storage setting), pages that are not
+UTF-8, and a copy that already carries highlights made in KOReader (their
+positions belong to the page as it was read before).
+
+**KOReader's own output is read strictly.** The plugin learns KOReader's
+tree from the engine's HTML dump, which writes attribute values unescaped
+(`alt="... <a href="...">"`). Where a tag ends was a heuristic; it is now
+decided by the form of the whole dump (every element closed by its own name,
+text only between the engine's text marks), with readings taken back when
+the form breaks. This also serves EPUBs.
+
+What was checked, and how:
+
+* Zotero's side is Zotero's own reader code (selector creation, resolution,
+  sort index, annotation text), run unchanged in headless Chromium on the
+  document built the way the reader builds it. Against it: the plugin's
+  tree is identical on 175 real pages (130 pages of Mozilla's Readability
+  test set, 45 of them saved again with SingleFile); the HTML parser passes
+  1541 of 1592 html5lib tree-construction tests (the rest: framesets, which
+  are refused, and a `<select>` parsing change browsers are adopting only
+  now); the plugin resolves 6879 of 6880 reference positions as Zotero does
+  and, for these, writes positions and sort indexes identical to Zotero's.
+* In KOReader's engine (Linux build of the same version), on the 45
+  SingleFile snapshots, prepared as described: of 1760 Zotero annotations
+  1730 land on their text, 30 are not placed, none lands elsewhere; of 1800
+  selections made in KOReader 1759 are uploaded, 41 refused, and all 1759
+  resolve in Zotero's code to the selected text (1717 written character for
+  character as Zotero would have). Nearly all of the 30 and 41 are one page
+  of formulas and the options of a drop-down list. On the 130 pages as they
+  come from the web (scripts, `<noscript>` and all): 5040 of 5120 placed,
+  4911 of 5120 uploaded, none wrong.
+* The whole path in a running reader with the plugin loaded (mock server):
+  download, preparation, import on opening, upload, edits and deletions in
+  both directions, closed documents - on five pages, with what was uploaded
+  resolved by Zotero's code.
+
+Limits:
+
+* Not tested against the real Zotero server or apps, nor on the device.
+  Zotero's desktop reader runs on Firefox's engine; the reference here is
+  Chromium. The two parse HTML by the same standard, but this is the largest
+  untested assumption.
+* Highlights and underlines only. Zotero's note and image annotations on
+  snapshots have no counterpart in KOReader and are left alone.
+* Text the two readers do not share cannot be annotated across: formulas
+  (KOReader typesets MathML itself), the options of drop-down lists, text a
+  page hides in a browser but KOReader shows (or the reverse), `<noscript>`
+  text (Zotero removes it; rare in snapshots, which are saved without
+  scripts). A highlight may run across such text; it cannot begin or end in
+  it.
+* A passage that repeats in the page (menus, lists of links) is placed only
+  if its surroundings tell the occurrences apart; otherwise it is refused
+  rather than put on the wrong one.
+* Pages that are not UTF-8: Zotero's reader decodes every snapshot as UTF-8,
+  KOReader honours the page's own declaration, so non-ASCII text differs.
+  ASCII passages still sync. (SingleFile saves UTF-8; this concerns old
+  snapshots.)
+* A page with a `<template shadowrootmode>` is read differently by older
+  and newer browser engines; the plugin reads such positions both ways and
+  writes them in the form that means the same in both (offsets from the
+  start of the page).
+* Framesets and pages using `<plaintext>` are refused.
+* The reading position of snapshots is not synced (Zotero stores a scroll
+  offset in pixels of its own layout).
+* As for EPUBs, Zotero positions for new KOReader highlights are worked out
+  while the page is open (at closing time at the latest); highlights made
+  before this version in a page that has not been opened since are uploaded
+  after it has been opened once.
 
 ## v0.8.1
 

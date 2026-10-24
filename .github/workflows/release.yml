@@ -1,0 +1,68 @@
+# A tag "v0.13" publishes version 0.13: the plugin's folder as a zip, attached
+# to a GitHub release. The plugin's updater (zotero_update.lua) looks for
+# exactly that file in the latest release.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The version in zoteroapi.lua must be the tag's
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          inside="$(grep -o 'fork v[0-9][0-9.]*' zoteroapi.lua | head -1 | sed 's/^fork v//')"
+          if [ "$tag" != "$inside" ]; then
+            echo "::error::The tag is v$tag but zoteroapi.lua says v$inside"
+            exit 1
+          fi
+
+      - name: Every Lua file must compile
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq luajit > /dev/null
+          cat > "$RUNNER_TEMP/compile.lua" <<'EOF'
+          -- every file named on the command line must compile (none is run)
+          for i = 1, #arg do
+            local chunk, err = loadfile(arg[i])
+            if not chunk then
+              print("::error file=" .. arg[i] .. "::" .. tostring(err))
+              os.exit(1)
+            end
+          end
+          print(#arg .. " Lua files compile")
+          EOF
+          luajit "$RUNNER_TEMP/compile.lua" *.lua
+
+      - name: Package the plugin's folder
+        run: |
+          mkdir -p dist/zoteroatelier.koplugin
+          cp *.lua LICENSE FORK_NOTES.md dist/zoteroatelier.koplugin/
+          (cd dist && zip -q -r zoteroatelier.koplugin.zip zoteroatelier.koplugin)
+          unzip -l dist/zoteroatelier.koplugin.zip
+
+      - name: Release notes from FORK_NOTES.md
+        run: |
+          awk -v v="## ${GITHUB_REF_NAME}" '
+            ($0 == v || index($0, v " ") == 1) { on = 1; next }
+            on && /^## / { exit }
+            on { print }
+          ' FORK_NOTES.md > notes.md
+          if [ ! -s notes.md ]; then echo "${GITHUB_REF_NAME}" > notes.md; fi
+          cat notes.md
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="$(grep -m1 "^## ${GITHUB_REF_NAME}" FORK_NOTES.md | sed 's/^## //')"
+          gh release create "$GITHUB_REF_NAME" dist/zoteroatelier.koplugin.zip \
+            --title "${title:-$GITHUB_REF_NAME}" --notes-file notes.md

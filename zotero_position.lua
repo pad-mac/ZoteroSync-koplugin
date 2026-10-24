@@ -40,6 +40,15 @@ function Position.enabled()
     return settings ~= nil and settings:readSetting("sync_reading_position") ~= false
 end
 
+--- Reading positions are synced for PDF and EPUB. (For a web snapshot Zotero
+-- keeps how far the page was scrolled, which has no counterpart here.)
+local function supported(ui)
+    local file = ui and ui.document and ui.document.file
+    if type(file) ~= "string" then return false end
+    local lower = file:lower()
+    return lower:match("%.pdf$") ~= nil or lower:match("%.epub$") ~= nil
+end
+
 local function is_pdf(path)
     return type(path) == "string" and path:lower():match("%.pdf$") ~= nil
 end
@@ -169,7 +178,7 @@ end
 --              reader is being sent somewhere else on purpose)
 -- @return page number jumped to, or nil
 function Position.apply(ui, key, stay)
-    if not Position.enabled() or not ui or not ui.document or not key then return nil end
+    if not Position.enabled() or not ui or not ui.document or not key or not supported(ui) then return nil end
     local value, version = ZoteroAPI.getRemotePosition(key)
     if value == nil then return nil end
     local ds = ui.doc_settings
@@ -209,7 +218,7 @@ end
 --- Send the open document's position to Zotero, if it changed here and not
 -- there. @return "sent" | "unchanged" | "newer" | "skipped" | "failed"
 function Position.pushOpen(ui, key)
-    if not Position.enabled() or not ui or not ui.document or not key then return "skipped" end
+    if not Position.enabled() or not ui or not ui.document or not key or not supported(ui) then return "skipped" end
     local ds = ui.doc_settings
     local before = copy_state(ds:readSetting(STATE_KEY))
     local st = copy_state(before)
@@ -242,7 +251,7 @@ end
 --- While an EPUB is still open: work out the Zotero form of the position it
 -- is closed at, so that a later sync can send it without opening the book.
 function Position.cacheOnClose(ui, key)
-    if not Position.enabled() or not ui or not ui.rolling or not ui.document or not key then return false end
+    if not Position.enabled() or not ui or not ui.rolling or not ui.document or not key or not supported(ui) then return false end
     local here = current(ui)
     if not here then return false end
     local ds = ui.doc_settings

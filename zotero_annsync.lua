@@ -31,6 +31,7 @@ local remote_api = {
 local function kind_of(file_path)
     if Annotations.isPdfPath(file_path) then return "pdf" end
     if Annotations.isEpubPath(file_path) then return "epub" end
+    if Annotations.isHtmlPath(file_path) then return "html" end
     return nil
 end
 Run.kindOf = kind_of
@@ -53,7 +54,7 @@ function Run.attachment(key, file_path, opts)
     if kind == "pdf" then
         converter = Doc.pdfConverter(file_path, ui and ui.document or nil, remote)
     else
-        converter = Doc.epubConverter(ui and ui.document or nil)
+        converter = Doc.epubConverter(ui and ui.document or nil, kind)
     end
     local stored_tomb = list:get("zotero_deleted")
     local tomb = {}

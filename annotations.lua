@@ -188,6 +188,13 @@ function Annotations.isEpubPath(file_path)
     return file_path ~= nil and string.lower(file_path):match("%.epub$") ~= nil
 end
 
+--- A web snapshot (an HTML file saved by Zotero).
+function Annotations.isHtmlPath(file_path)
+    if file_path == nil then return false end
+    local lower = string.lower(file_path)
+    return lower:match("%.html?$") ~= nil or lower:match("%.xhtml$") ~= nil
+end
+
 -- ---------------------------------------------------------------------------
 -- Field views used by the sync engine
 -- ---------------------------------------------------------------------------

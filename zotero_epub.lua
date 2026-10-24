@@ -801,7 +801,9 @@ end
 
 --- Parse the output of getHTMLFromXPointer(fragment, 0x0002): elements, and
 -- text nodes delimited by the two marks above.
-local function parse_engine_html(html)
+-- @param balanced_quotes a tag ends only where its quotes are balanced (an
+--        attribute value may itself contain markup: alt="... <a href="...">")
+local function parse_engine_html(html, balanced_quotes)
     local root = { kids = {} }
     local cur = root
     local pos, len = 1, #html
@@ -833,18 +835,28 @@ local function parse_engine_html(html)
             else
                 -- attribute values are written unescaped, so the tag ends at
                 -- the first '>' that is followed by markup, a text mark or the end
+                -- (and inside which every quote is closed: a value may itself
+                -- contain markup, such as alt="... <br> <a href="...">")
                 local search = pos + 1
-                local e
+                local e, fallback
+                local quotes = 0
                 while true do
                     local s = html:find(">", search, true)
                     if not s then break end
+                    local _, more = html:sub(search, s):gsub('"', "")
+                    quotes = quotes + more
                     local nxt = html:byte(s + 1)
                     if nxt == nil or nxt == 60 or html:sub(s + 1, s + 3) == TEXT_OPEN then
-                        e = s
-                        break
+                        if quotes % 2 == 0 or not balanced_quotes then
+                            e = s
+                            break
+                        end
+                        fallback = fallback or s
+                        if s - pos > 100000 then break end
                     end
                     search = s + 1
                 end
+                e = e or fallback
                 if not e then return nil, "unterminated tag" end
                 local inner = html:sub(pos + 1, e - 1)
                 local last = inner:sub(-1)
@@ -866,20 +878,238 @@ local function parse_engine_html(html)
     return root
 end
 
+-- The same, without guessing. The engine writes attribute values as they
+-- are - alt="... <a href="...">", data-x="{"a":"<p>"}" - so where a tag ends
+-- cannot be told from the tag alone. But the whole output has a strict form:
+-- elements that are closed by their own name, text only between the two
+-- marks, nothing else. A tag is read with the first end its attributes
+-- allow; when what follows then breaks the form, the reading is taken back
+-- to the most recent tag that has another end beyond the place of the break.
+-- (A value never holds a text mark, which keeps the other ends of a tag few
+-- and near: a tag cannot swallow the text that follows it.)
+local S_HTML, S_LEN, S_VIS, S_QUOTA, S_COUNT, S_FROM, S_BEYOND, S_END, S_SELF
+local S_MARK, S_MARK_FROM
+local byte, find, sub = string.byte, string.find, string.sub
+
+local function strict_follows(p)
+    if p > S_LEN then return true end
+    local b = byte(S_HTML, p)
+    return b == 60 or (b == 0xE2 and sub(S_HTML, p, p + 2) == TEXT_OPEN)
+end
+
+--- p is where the tag's name or one of its attributes ended: every way the
+-- tag can end from there, in a fixed order; true at the first one that counts.
+local function strict_after(p)
+    if S_VIS[p] then return false end
+    S_VIS[p] = true
+    local b = byte(S_HTML, p)
+    if b == 62 then -- '>'
+        if strict_follows(p + 1) then
+            S_COUNT = S_COUNT + 1
+            if S_COUNT >= S_FROM and p > S_BEYOND then
+                S_END, S_SELF = p, false
+                return true
+            end
+        end
+        return false
+    elseif b == 47 or b == 63 then -- '/>', '?>'
+        if byte(S_HTML, p + 1) == 62 and strict_follows(p + 2) then
+            S_COUNT = S_COUNT + 1
+            if S_COUNT >= S_FROM and p + 1 > S_BEYOND then
+                S_END, S_SELF = p + 1, true
+                return true
+            end
+        end
+        return false
+    elseif b ~= 32 then
+        return false
+    end
+    local ne = find(S_HTML, "[%s=>]", p + 1)
+    if not ne or ne == p + 1 then return false end
+    local c = byte(S_HTML, ne)
+    if c == 61 then -- name="value": the value is not empty, and ends at a quote that something can follow
+        if byte(S_HTML, ne + 1) ~= 34 then return false end
+        local q = ne + 3
+        while true do
+            q = find(S_HTML, '"', q, true)
+            if not q or q > S_MARK then return false end
+            S_QUOTA = S_QUOTA - 1
+            if S_QUOTA <= 0 then return false end
+            local n = byte(S_HTML, q + 1)
+            if n == 32 or n == 62 or ((n == 47 or n == 63) and byte(S_HTML, q + 2) == 62) then
+                if strict_after(q + 1) then return true end
+            end
+            q = q + 1
+        end
+    elseif c == 62 then -- a name without value, then the end of the tag
+        local last = byte(S_HTML, ne - 1)
+        if (last == 47 or last == 63) and ne - 1 > p + 1 and strict_after(ne - 1) then return true end
+        return strict_after(ne)
+    end
+    return strict_after(ne)
+end
+
+--- The tag that starts at `at`: its first end with number >= from that lies beyond `beyond`.
+-- @return position of its ">", childless?, number of that end, where its name ends   or nil
+local function strict_tag_end(at, from, beyond)
+    local ne = find(S_HTML, "[%s>]", at + 1)
+    if not ne or ne == at + 1 then return nil end
+    if byte(S_HTML, ne) == 62 then
+        if from > 1 or ne <= beyond or not strict_follows(ne + 1) then return nil end
+        local last = byte(S_HTML, ne - 1)
+        if (last == 47 or last == 63) and ne - 1 > at + 1 then return ne, true, 1, ne - 1 end
+        return ne, false, 1, ne
+    end
+    if not (S_MARK and S_MARK_FROM <= at and at < S_MARK) then
+        S_MARK_FROM = at
+        S_MARK = find(S_HTML, TEXT_OPEN, at, true) or (S_LEN + 1)
+    end
+    S_VIS, S_COUNT, S_FROM, S_BEYOND, S_END = {}, 0, from, beyond, nil
+    if not strict_after(ne) then return nil end
+    return S_END, S_SELF, S_COUNT, ne
+end
+
+local function parse_engine_strict(html)
+    local len = #html
+    S_HTML, S_LEN, S_QUOTA, S_MARK = html, len, 1000000 + len, nil
+    local root = { kids = {} }
+    local cur = root
+    local pos = 1
+    -- every tag read so far: where it starts, which of its ends was taken,
+    -- and the state of the tree before it
+    local c_pos, c_k, c_cur, c_trail, c_broke, nc = {}, {}, {}, {}, {}, 0
+    local trail, nt = {}, 0 -- the parent of every node, in the order the nodes were added
+    local steps, max_steps = 0, 400000 + math.floor(len / 4)
+    local furthest = 0
+
+    local function start(at, from, beyond)
+        local e, childless, k, name_end = strict_tag_end(at, from, beyond)
+        if not e then return false end
+        nc = nc + 1
+        c_pos[nc], c_k[nc], c_cur[nc], c_trail[nc], c_broke[nc] = at, k, cur, nt, false
+        local full = sub(html, at + 1, name_end - 1)
+        local node = { name = full:match(":([^:]+)$") or full, full = full, kids = {}, parent = cur }
+        if node.name == "DocFragment" then
+            node.source = sub(html, at + 1, e - 1):match('%sSource="([^"]*)"')
+        end
+        cur.kids[#cur.kids + 1] = node
+        nt = nt + 1; trail[nt] = cur
+        if not childless then cur = node end
+        pos = e + 1
+        return true
+    end
+
+    --- The form broke at `pos`: back to the most recent tag that can end
+    -- beyond the first break that followed its reading (a tag that ends too
+    -- early is followed by a break before its true end; later breaks may be
+    -- those of other attempts).
+    local function take_back()
+        local broke = pos
+        do
+            local i = nc
+            while i > 0 and not c_broke[i] do
+                c_broke[i] = broke
+                i = i - 1
+            end
+        end
+        if broke > furthest then furthest = broke end
+        while nc > 0 do
+            local at, k, beyond = c_pos[nc], c_k[nc], c_broke[nc]
+            local keep = c_trail[nc]
+            while nt > keep do
+                local parent = trail[nt]
+                parent.kids[#parent.kids] = nil
+                trail[nt] = nil
+                nt = nt - 1
+            end
+            cur = c_cur[nc]
+            nc = nc - 1
+            steps = steps + 1
+            if steps > max_steps or S_QUOTA <= 0 then return false end
+            if start(at, k + 1, beyond) then return true end
+        end
+        return false
+    end
+
+    while true do
+        steps = steps + 1
+        if steps > max_steps then return nil, "too many readings", furthest end
+        local ok = true
+        if pos > len then
+            if cur == root then break end
+            ok = false
+        else
+            local b = byte(html, pos)
+            if b == 0xE2 and sub(html, pos, pos + 2) == TEXT_OPEN then
+                -- the text node ends at the closing mark that is followed by markup
+                local search = pos + 3
+                local close
+                while true do
+                    local s = find(html, TEXT_CLOSE, search, true)
+                    if not s then break end
+                    local nxt = byte(html, s + 3)
+                    if nxt == nil or nxt == 60 or sub(html, s + 3, s + 5) == TEXT_OPEN then
+                        close = s
+                        break
+                    end
+                    search = s + 3
+                end
+                if close then
+                    cur.kids[#cur.kids + 1] = { text = unescape_engine_text(sub(html, pos + 3, close - 1)), parent = cur }
+                    nt = nt + 1; trail[nt] = cur
+                    pos = close + 3
+                else
+                    ok = false
+                end
+            elseif b == 60 then -- '<'
+                if byte(html, pos + 1) == 47 then -- '/'
+                    local e = find(html, ">", pos + 2, true)
+                    if e and cur ~= root and sub(html, pos + 2, e - 1) == cur.full then
+                        cur = cur.parent
+                        pos = e + 1
+                    else
+                        ok = false
+                    end
+                else
+                    ok = start(pos, 1, 0)
+                end
+            else
+                ok = false
+            end
+        end
+        if not ok and not take_back() then return nil, "not in the engine's form", furthest end
+    end
+    if not root.kids[1] then return nil, "empty" end
+    return root
+end
+
+Epub._parseEngineStrict, Epub._parseEngineLoose = parse_engine_strict, parse_engine_html -- (tests)
+
 --- Build the engine-side model of one DocFragment.
 -- @param html      output of getHTMLFromXPointer(frag_xp, 0x0002)
 -- @param frag_xp   xpointer of the DocFragment element
 -- @param legacy    true for books kept on a pre-2018 DOM version, whose
 --                  xpointers name crengine's internal boxing elements
-function Epub.engineModel(html, frag_xp, legacy)
+-- @param root_name name of the root element (default "DocFragment", a chapter
+--                  of an EPUB; "body" for an HTML file)
+-- @param hidden    names of further elements whose text does not count
+function Epub.engineModel(html, frag_xp, legacy, root_name, hidden_names, balanced_quotes)
     if type(html) ~= "string" or html == "" then return nil, "empty fragment" end
-    local root, err = parse_engine_html(html)
+    local root, err
+    if balanced_quotes == "strict" or balanced_quotes == nil then
+        root = parse_engine_strict(html)
+        if not root and balanced_quotes == "strict" then return nil, "not in the engine's form" end
+    end
+    if not root then
+        root, err = parse_engine_html(html, balanced_quotes == true)
+    end
     if not root then return nil, err end
     local frag = root.kids[1]
-    if not frag or frag.name ~= "DocFragment" then
-        return nil, "not a DocFragment"
+    if not frag or frag.name ~= (root_name or "DocFragment") then
+        return nil, "not a " .. (root_name or "DocFragment")
     end
-    local model = { texts = {}, images = {}, source = frag.source, frag = frag, frag_xp = frag_xp, has_boxing = false }
+    local model = { texts = {}, images = {}, source = frag.source, frag = frag, frag_xp = frag_xp, has_boxing = false,
+        plain_root = root_name ~= nil }
 
     local function collect(node, out)
         for _, k in ipairs(node.kids) do
@@ -909,7 +1139,7 @@ function Epub.engineModel(html, frag_xp, legacy)
                     model.images[#model.images + 1] = { node = k, next_ti = #model.texts + 1 }
                     k.image_index = #model.images
                 end
-                walk(k, hidden or NO_TEXT[k.name] == true)
+                walk(k, hidden or NO_TEXT[k.name] == true or (hidden_names ~= nil and hidden_names[k.name] == true))
             else
                 model.texts[#model.texts + 1] = { text = k.text, node = k, counted = not hidden }
                 k.ti = #model.texts
@@ -972,8 +1202,15 @@ Epub.fragmentNumber = fragment_number
 --- Node of the engine model an xpointer addresses, and its offset.
 local function engine_resolve(model, xp)
     local path, offset = split_xpointer(xp)
-    local rest = path:gsub("^/body/DocFragment%[%d+%]", "", 1)
-    if rest == path then rest = path:gsub("^/body/DocFragment", "", 1) end
+    local rest
+    if model.plain_root then
+        if path:sub(1, #model.frag_xp) ~= model.frag_xp then return nil end
+        rest = path:sub(#model.frag_xp + 1)
+        if rest ~= "" and rest:sub(1, 1) ~= "/" then return nil end
+    else
+        rest = path:gsub("^/body/DocFragment%[%d+%]", "", 1)
+        if rest == path then rest = path:gsub("^/body/DocFragment", "", 1) end
+    end
     local node = model.frag
     for seg in rest:gmatch("/([^/]+)") do
         if not node.ukids then return nil end
@@ -1530,6 +1767,8 @@ local function cfi_range(frag, cfi)
     return a0, a1
 end
 
+local engine_range_xpointers
+
 --- Engine-stream range of a passage found by its text.
 -- @param hint approximate stream position, or nil
 local function text_range(frag, needle, hint)
@@ -1621,12 +1860,20 @@ function Session:fromZotero(position, text, sort_index)
         return nil, "the annotated passage was not found in the chapter"
     end
 
-    local e0, eb0 = point_at(frag.engine, b0 + 1)
-    local e1, eb1 = point_at(frag.engine, b1)
+    local xp0, xp1 = engine_range_xpointers(self.doc, frag.engine, b0, b1)
+    if not xp0 then return nil, xp1 end
+    return xp0, xp1, how
+end
+
+--- xpointers of the range [b0, b1) of an engine model's text, checked
+-- against the open document. @return xp0, xp1  or nil, reason
+function engine_range_xpointers(doc, engine, b0, b1)
+    local e0, eb0 = point_at(engine, b0 + 1)
+    local e1, eb1 = point_at(engine, b1)
     if not e0 or not e1 then return nil, "the position lies outside the text" end
-    local t0, t1 = frag.engine.texts[e0], frag.engine.texts[e1]
+    local t0, t1 = engine.texts[e0], engine.texts[e1]
     eb1 = eb1 + Util.utf8SeqLen(t1.text:byte(eb1))
-    local path0, path1 = engine_path(frag.engine, t0.node), engine_path(frag.engine, t1.node)
+    local path0, path1 = engine_path(engine, t0.node), engine_path(engine, t1.node)
     if not path0 or not path1 then return nil, "the position could not be expressed for the reading engine" end
     local xp0 = path0 .. "." .. Util.utf8Len(t0.text:sub(1, eb0 - 1))
     local xp1 = path1 .. "." .. Util.utf8Len(t1.text:sub(1, eb1 - 1))
@@ -1634,7 +1881,6 @@ function Session:fromZotero(position, text, sort_index)
     -- Check against the live document: both ends exist and sit in the text
     -- nodes we think they do, and the text the reader shows between them is
     -- the passage we meant (minus whatever the book's styles hide).
-    local doc = self.doc
     if not call(doc, "isXPointerInDocument", xp0) or not call(doc, "isXPointerInDocument", xp1) then
         return nil, "the computed position does not exist in the open book"
     end
@@ -1647,14 +1893,14 @@ function Session:fromZotero(position, text, sort_index)
         return nil, "the computed position could not be checked in the open book"
     end
     local have = Util.normText(got)
-    local want = Util.normText(frag.engine.stream:sub(b0 + 1, b1))
+    local want = Util.normText(engine.stream:sub(b0 + 1, b1))
     if strip_ws(got) == "" then
         return nil, "the annotated passage is not displayed in the book"
     end
     if have ~= want and not is_subsequence(have, want) then
         return nil, "the open book shows different text at the computed position"
     end
-    return xp0, xp1, how
+    return xp0, xp1
 end
 
 -- ---------------------------------------------------------------------------
@@ -1861,5 +2107,14 @@ function Session:cfiFromXPointer(xp)
     end
     return cfi
 end
+
+--- What the module for web snapshots shares with this one.
+Epub._x = {
+    strip_ws = strip_ws, finish_stream = finish_stream, stream_pos = stream_pos, point_at = point_at,
+    locate = locate, map_range = map_range, text_range = text_range, same_passage = same_passage,
+    is_subsequence = is_subsequence, same_node_text = same_node_text, engine_path = engine_path,
+    engine_point = engine_point, split_xpointer = split_xpointer, call = call,
+    engine_range_xpointers = function(...) return engine_range_xpointers(...) end,
+}
 
 return Epub

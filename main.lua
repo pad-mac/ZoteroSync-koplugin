@@ -23,6 +23,9 @@ local Doc = require("zotero_doc")
 local AnnotationSync = require("zotero_annsync")
 local Colors = require("zotero_colors")
 local Position = require("zotero_position")
+local Icons = require("zotero_icons")
+local Highlight = require("zotero_highlight")
+local Update = require("zotero_update")
 local itemInfoViewer = require("zoteroiteminfo")
 local AnnotationPanel = require("annotation_panel")
 local AnnotationSearch = require("annotation_search")
@@ -47,7 +50,8 @@ local foreign_modules = {}
 for name, mod in pairs({
     zoteroapi = ZoteroAPI, annotations = Annotations, zotero_util = Util, zotero_sync = Sync,
     zotero_doc = Doc, zotero_annsync = AnnotationSync, zotero_colors = Colors, zotero_position = Position, zoteroiteminfo = itemInfoViewer,
-    annotation_panel = AnnotationPanel, annotation_search = AnnotationSearch,
+    annotation_panel = AnnotationPanel, annotation_search = AnnotationSearch, zotero_icons = Icons,
+    zotero_highlight = Highlight, zotero_update = Update,
 }) do
     if type(mod) ~= "table" or mod.fork ~= FORK then
         foreign_modules[#foreign_modules + 1] = name
@@ -202,11 +206,17 @@ function ZoteroBrowser:onLeftButtonTap()
 end
 function ZoteroBrowser:onReturn()
     table.remove(self.paths, #self.paths)
-    local dir = table.remove(self.keys, #self.keys)
-    if #self.keys == 0 then
+    table.remove(self.keys, #self.keys)
+    local top = self.keys[#self.keys]
+    if top == nil then
         self:displayCollection(nil)
+    elseif top == "search" then
+        -- back to an earlier search: shown again (it puts itself on the path)
+        local query = table.remove(self.paths, #self.paths)
+        table.remove(self.keys, #self.keys)
+        self:displaySearchResults(query)
     else
-        self:displayCollection(self.keys[#self.keys])
+        self:displayCollection(top)
     end
     return true
 end
@@ -313,8 +323,7 @@ function ZoteroBrowser:onMenuSelect(item)
         table.insert(self.keys, item.key)
         self:displayCollection(item.key)
     elseif item.type == "wildcard_collection" then
-        table.insert(self.paths, "All items")
-        table.insert(self.keys, "all")
+        -- (one level, as a search for everything: one Return leads back)
         self:displaySearchResults("")
     elseif item.type == "item" then
         self:openItem(item.key, item.text)
@@ -354,6 +363,10 @@ function ZoteroBrowser:onMenuHold(item)
                                 ZoteroAPI.addOfflineCollection(item.key)
                             end
                             UIManager:close(collection_dialog)
+                            -- the folder in the list shows the choice
+                            item.offline = not is_offline_enabled
+                            item.decorated = nil
+                            self:updateItems()
                         end,
                     },
                 },
@@ -410,9 +423,13 @@ function ZoteroBrowser:zPath()
     local path = "HOME"
     if #self.paths > 0 then
         if self.keys[#self.keys] == "search" then
-            path = "Search results: '" .. self.paths[#self.paths] .. "'"
+            if self.paths[#self.paths] == "" then
+                path = "/" .. _("All Items")
+            else
+                path = "Search results: '" .. self.paths[#self.paths] .. "'"
+            end
         else
-            path = "/" .. table.concat(self.paths, "")
+            path = "/" .. table.concat(self.paths, "/")
         end
     end
     return path
@@ -421,6 +438,50 @@ end
 function ZoteroBrowser:setItems(items, subtitle)
     local subtitle = self:zPath()
     self:switchItemTable("Zotero Browser", items, nil, nil, subtitle)
+end
+
+--- What a row shows besides its text. Collections are set in bold, with a
+-- folder; an entry gets the picture of the file a tap opens, black when that
+-- file is on this device, grey when it has to be downloaded first.
+-- Worked out for the rows of the page that is shown, when it is shown: a
+-- collection may hold hundreds of entries, and each one costs a look at the
+-- database and at the storage folder.
+function ZoteroBrowser:decoratePage()
+    local items = self.item_table
+    if type(items) ~= "table" or not self.item_dimen or not self.perpage or not self.page then return end
+    if not self.icon_metrics or self.icon_metrics_h ~= self.item_dimen.h or self.icon_metrics_font ~= self.font_size then
+        self.icon_metrics = Icons.metrics(self.item_dimen.h, self.font_size)
+        self.icon_metrics_h, self.icon_metrics_font = self.item_dimen.h, self.font_size
+        self.state_w = self.icon_metrics.w + math.floor(self.icon_metrics.h * 0.3)
+        for __, item in ipairs(items) do item.decorated = nil end
+    end
+    local m = self.icon_metrics
+    local first = (self.page - 1) * self.perpage + 1
+    for index = first, math.min(#items, first + self.perpage - 1) do
+        local item = items[index]
+        if not item.decorated then
+            item.decorated = true
+            item.state, item.bold = nil, nil
+            if item.type == "collection" or item.type == "wildcard_collection" then
+                item.bold = true
+                item.state = Icons.folder(m, item.offline)
+            elseif item.type == "item" or item.type == "attachment" then
+                local ok, kind, on_device = pcall(ZoteroAPI.entryFileState, item.key, item.type == "attachment")
+                if not ok then
+                    logger.warn("Zotero: state of entry", tostring(item.key), "not determined:", tostring(kind))
+                elseif kind then
+                    item.file_kind, item.on_device = kind, on_device
+                    item.state = Icons.file(m, kind, on_device)
+                end
+            end
+        end
+    end
+end
+
+function ZoteroBrowser:updateItems(select_number, no_recalculate_dimen)
+    local ok, err = pcall(self.decoratePage, self)
+    if not ok then logger.warn("Zotero: browser rows not decorated:", tostring(err)) end
+    Menu.updateItems(self, select_number, no_recalculate_dimen)
 end
 local Plugin = WidgetContainer:new({
     name = "zoteroatelier",
@@ -509,12 +570,202 @@ function Plugin:applyZoteroPosition(quiet, stay)
     return page
 end
 
+-- ---------------------------------------------------------------------------
+-- A profile per kind of document
+--
+-- KOReader's profiles (Tools > Profiles) hold a set of settings - font,
+-- margins, line spacing, zoom, ... - that is applied in one go. Here one of
+-- them can be named for each kind of Zotero document; it is applied when a
+-- document of that kind is opened. Only for documents that belong to Zotero:
+-- other books keep to KOReader's own rules.
+-- ---------------------------------------------------------------------------
+local PROFILE_KINDS = { "pdf", "epub", "html" }
+
+--- KOReader's profiles, by name.
+local function koreaderProfiles(ui)
+    local plugin = ui and ui.profiles
+    if plugin and type(plugin.data) == "table" then return plugin.data end
+    -- (the Profiles plugin is switched off: its profiles are still there)
+    local ok, settings = pcall(function()
+        return require("luasettings"):open(DataStorage:getSettingsDir() .. "/profiles.lua")
+    end)
+    return ok and settings and type(settings.data) == "table" and settings.data or {}
+end
+
+--- A short value that changes when anything in the profile does.
+local function profileSignature(profile)
+    local function write(v)
+        if type(v) ~= "table" then return type(v):sub(1, 1) .. tostring(v) end
+        local keys = {}
+        for k in pairs(v) do keys[#keys + 1] = k end
+        table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+        local out = {}
+        for __, k in ipairs(keys) do out[#out + 1] = tostring(k) .. "=" .. write(v[k]) end
+        return "{" .. table.concat(out, ",") .. "}"
+    end
+    return require("ffi/sha2").md5(write(profile))
+end
+
+local function typeProfiles()
+    local map = ZoteroAPI.getSettings():readSetting("type_profiles")
+    return type(map) == "table" and map or {}
+end
+
+--- The profile chosen for the open document's kind, applied.
+-- @return the profile's name when it was applied
+function Plugin:applyTypeProfile()
+    local ui = self.ui
+    if not init_done or not ui or not ui.document or not ui.doc_settings then return nil end
+    local map = typeProfiles()
+    if next(map) == nil then return nil end
+    local key, path = AnnotationSync.identify(ui)
+    local kind = key and AnnotationSync.kindOf(path)
+    local name = kind and map[kind]
+    if not name then return nil end
+    local profile = koreaderProfiles(ui)[name]
+    if type(profile) ~= "table" then
+        logger.warn("Zotero: the profile chosen for", kind, "documents no longer exists:", name)
+        return nil
+    end
+    -- Once per document and state of the profile: what is changed in a single
+    -- document afterwards stays, until the profile itself is changed (or
+    -- another one is chosen), which every document then takes up when opened.
+    local signature = name .. ":" .. profileSignature(profile)
+    if ui.doc_settings:readSetting("zotero_type_profile") == signature then return nil end
+    logger.info("Zotero: applying profile", name, "to", path)
+    Dispatcher:init()
+    -- A profile's settings are sent to the window on top. That is the reader,
+    -- unless a message happens to lie over it at this moment: then they are
+    -- handed to the reader directly, or they would go to the message and be lost.
+    local on_top = false
+    for widget in UIManager:topdown_widgets_iter() do
+        if not widget.toast then
+            on_top = widget == ui or widget == ui.dialog
+            break
+        end
+    end
+    local real_send = UIManager.sendEvent
+    if not on_top then
+        UIManager.sendEvent = function(__, event) return ui:handleEvent(event) end
+    end
+    -- (a profile that is set to show as a menu is carried out all the same)
+    local ok, err = pcall(Dispatcher.execute, Dispatcher, profile, { qm_show = false })
+    UIManager.sendEvent = real_send
+    if not ok then
+        -- (the dispatcher silences notifications while it works)
+        UIManager:setSilentMode(false)
+        error(err, 0)
+    end
+    ui.doc_settings:saveSetting("zotero_type_profile", signature)
+    return name
+end
+
+function Plugin:getTypeProfileMenu()
+    local labels = { pdf = "PDF", epub = "EPUB", html = _("Web snapshot") }
+    local function set(kind, name)
+        local map = typeProfiles()
+        map[kind] = name
+        ZoteroAPI.getSettings():saveSetting("type_profiles", map)
+        ZoteroAPI.saveSettingsToFile()
+    end
+    local menu = {}
+    for __, kind in ipairs(PROFILE_KINDS) do
+        menu[#menu + 1] = {
+            text_func = function()
+                local name = typeProfiles()[kind]
+                if name and type(koreaderProfiles(self.ui)[name]) ~= "table" then
+                    name = name .. " " .. _("(no longer exists)")
+                end
+                return labels[kind] .. ": " .. (name or _("no profile"))
+            end,
+            sub_item_table_func = function()
+                local names = {}
+                for name, profile in pairs(koreaderProfiles(self.ui)) do
+                    if type(name) == "string" and type(profile) == "table" then names[#names + 1] = name end
+                end
+                table.sort(names, function(a, b) return a:lower() < b:lower() end)
+                local sub = { {
+                    text = _("No profile"),
+                    radio = true,
+                    checked_func = function() return typeProfiles()[kind] == nil end,
+                    callback = function() set(kind, nil) end,
+                    separator = true,
+                } }
+                for __, name in ipairs(names) do
+                    sub[#sub + 1] = {
+                        text = name,
+                        radio = true,
+                        checked_func = function() return typeProfiles()[kind] == name end,
+                        callback = function() set(kind, name) end,
+                    }
+                end
+                if #names == 0 then
+                    sub[#sub + 1] = {
+                        text = _("There are no profiles yet"),
+                        keep_menu_open = true,
+                        callback = function()
+                            UIManager:show(InfoMessage:new({
+                                text = _("Profiles are made in KOReader's own menu: Tools > Profiles. Open a document of the kind, set font, margins and so on as you like them, then choose \"New with current book settings\" there. The profile can then be chosen here."),
+                            }))
+                        end,
+                    }
+                end
+                return sub
+            end,
+        }
+    end
+    return menu
+end
+
+--- A web snapshot that was stored before snapshots were prepared for
+-- KOReader's engine (ZoteroAPI.prepareSnapshot) and that carries no
+-- highlights yet: prepared now, and opened again.
+-- @return true when the document is being opened again
+local snapshot_tried = {}
+function Plugin:prepareOpenSnapshot(ui)
+    if not ui.rolling or not ui.doc_settings or not ui.annotation then return false end
+    local key, path = AnnotationSync.identify(ui)
+    if not key or AnnotationSync.kindOf(path) ~= "html" or snapshot_tried[path] then return false end
+    local storage = ZoteroAPI.storage_dir
+    if not storage or path:sub(1, #storage + 1) ~= storage .. "/" then return false end
+    local size = lfs.attributes(path, "size")
+    if not size or ui.doc_settings:readSetting("zotero_snapshot_checked") == size then return false end
+    snapshot_tried[path] = true
+    if #ui.annotation.annotations > 0 then return false end
+    local f = io.open(path, "rb")
+    local src = f and f:read("*a")
+    if f then f:close() end
+    if type(src) ~= "string" then return false end
+    if not require("zotero_html").engineCopy(src) then
+        ui.doc_settings:saveSetting("zotero_snapshot_checked", size)
+        return false
+    end
+    logger.info("Zotero: snapshot is opened again after being prepared for the reading engine:", path)
+    ui:reloadDocument(function()
+        local ok, err = pcall(ZoteroAPI.prepareSnapshot, path)
+        if not ok then logger.warn("Zotero: snapshot not prepared:", tostring(err)) end
+    end)
+    return true
+end
+
 function Plugin:onReaderReady()
     if not init_done or not self.ui or not self.ui.document then return end
     local ui = self.ui
+    -- the profile for this kind of document, as soon as the document stands
+    -- (not when it was only opened again by the reader, to take up a setting)
+    if not ui.reloading then
+        UIManager:nextTick(function()
+            if not ui.document then return end
+            local ok, err = pcall(function() self:applyTypeProfile() end)
+            if not ok then logger.warn("Zotero: applying the profile failed:", tostring(err)) end
+        end)
+    end
     -- a moment later, so that the document shows first
     UIManager:scheduleIn(0.3, function()
         if not ui.document then return end -- closed again already
+        local okp, again = pcall(function() return self:prepareOpenSnapshot(ui) end)
+        if not okp then logger.warn("Zotero: preparing the snapshot failed:", tostring(again)) end
+        if okp and again then return end -- the import runs when it is open again
         local ok, err = pcall(function() self:importOpenDocument() end)
         if not ok then
             logger.err("Zotero: annotation import on open failed:", tostring(err))
@@ -552,8 +803,9 @@ function Plugin:onCloseDocument()
     local ok, err = pcall(function()
         local key, file_path
         if ui.rolling then key, file_path = AnnotationSync.identify(ui) end
-        if key and AnnotationSync.kindOf(file_path) then
-            local n = Doc.cacheEpubPositions(ui)
+        local kind = key and AnnotationSync.kindOf(file_path)
+        if kind then
+            local n = Doc.cacheEpubPositions(ui, kind)
             -- and the Zotero form of the place the book is closed at
             if Position.cacheOnClose(ui, key) then n = n + 1 end
             if n > 0 and ui.dialog ~= ui then
@@ -562,7 +814,7 @@ function Plugin:onCloseDocument()
             end
         end
     end)
-    if not ok then logger.warn("Zotero: preparing EPUB positions failed:", tostring(err)) end
+    if not ok then logger.warn("Zotero: preparing positions on closing failed:", tostring(err)) end
 end
 
 --- Keep the device from dozing while a sync runs. On Android the only means
@@ -593,6 +845,173 @@ end
 --- Run a sync: one at a time, online, with progress messages the user can
 -- stop, and with a message instead of silence if it fails unexpectedly.
 -- @param fn function(progress, stopped)
+-- ---------------------------------------------------------------------------
+-- Updates of the plugin (zotero_update.lua)
+-- ---------------------------------------------------------------------------
+
+local function runningVersion() return Update.versionOf(ZoteroAPI.version) end
+local function updateDir() return ZoteroAPI.zotero_dir .. "/update" end
+
+--- A version installed on disk that runs only after a restart, or nil.
+local function installedNotRunning()
+    local installed = ZoteroAPI.getSettings():readSetting("update_installed")
+    if installed and Update.newer(installed, runningVersion()) then return installed end
+    return nil
+end
+
+local function offerRestart(version)
+    UIManager:askForRestart(string.format(_("Zotero Atelier %s is installed. It runs after KOReader has been restarted."), "v" .. version))
+end
+
+--- Install a release; the outcome is noted in the settings. @return true or nil, reason
+function Plugin:installRelease(release)
+    local ok, err = Update.install(release, self.path, updateDir())
+    if ok then
+        local settings = ZoteroAPI.getSettings()
+        settings:saveSetting("update_installed", release.version)
+        settings:delSetting("update_skip")
+        ZoteroAPI.saveSettingsToFile()
+    end
+    return ok, err
+end
+
+--- After a sync (the network is up then): at most once a day, look for a new
+-- version and install it. Quiet when nothing is found or GitHub cannot be
+-- reached. @return a line for the sync's summary, or nil
+function Plugin:autoUpdate(progress)
+    local settings = ZoteroAPI.getSettings()
+    if not Update.due(settings) or not self.path then return nil end
+    settings:saveSetting("update_last_check", os.time())
+    ZoteroAPI.saveSettingsToFile()
+    progress(_("Looking for a new version of the plugin…"))
+    local release, err = Update.latest()
+    if not release then
+        logger.info("Zotero: update check:", tostring(err))
+        return nil
+    end
+    if not Update.newer(release.version, runningVersion())
+        or release.version == installedNotRunning()
+        or release.version == settings:readSetting("update_skip") then
+        return nil
+    end
+    progress(string.format(_("Installing version %s of the plugin…"), release.version))
+    local ok, ierr = self:installRelease(release)
+    if not ok then
+        logger.warn("Zotero: update to", release.version, "failed:", tostring(ierr))
+        return string.format(_("A new version of the plugin (%s) could not be installed: %s"), release.version, tostring(ierr))
+    end
+    self.restart_for = release.version
+    return string.format(_("The plugin was updated to version %s; it runs after KOReader has been restarted."), release.version)
+end
+
+--- "Check for updates now".
+function Plugin:checkForUpdate()
+    NetworkMgr:runWhenOnline(function()
+        Trapper:wrap(function()
+            Trapper:info(_("Looking for a new version of the plugin…"))
+            local settings = ZoteroAPI.getSettings()
+            settings:saveSetting("update_last_check", os.time())
+            ZoteroAPI.saveSettingsToFile()
+            local release, err = Update.latest()
+            if not release then
+                Trapper:info(_("No update could be found:") .. " " .. tostring(err))
+                return
+            end
+            local running = runningVersion()
+            if not Update.newer(release.version, running) then
+                Trapper:info(string.format(_("This is the latest version (%s)."), "v" .. tostring(running)))
+                return
+            end
+            if release.version == installedNotRunning() then
+                Trapper:clear()
+                offerRestart(release.version)
+                return
+            end
+            local notes = (release.notes or ""):gsub("\r", "")
+            if #notes > 1200 then notes = notes:sub(1, 1200):gsub("[^\n]*$", "") .. "…" end
+            local go = Trapper:confirm(string.format(_("Version %s is available (this is %s).\n\n%s\n\nInstall it now?"),
+                "v" .. release.version, "v" .. tostring(running), notes), _("Later"), _("Install"))
+            if not go then
+                Trapper:clear()
+                return
+            end
+            Trapper:info(string.format(_("Installing version %s of the plugin…"), release.version))
+            local ok, ierr = self:installRelease(release)
+            Trapper:clear()
+            if not ok then
+                UIManager:show(InfoMessage:new({ text = _("The update could not be installed:") .. "\n" .. tostring(ierr), icon = "notice-warning" }))
+                return
+            end
+            offerRestart(release.version)
+        end)
+    end)
+end
+
+function Plugin:getUpdateMenu()
+    return {
+        {
+            text_func = function()
+                local waiting = installedNotRunning()
+                if waiting then
+                    return string.format(_("Restart KOReader to use %s"), "v" .. waiting)
+                end
+                return string.format(_("Check for updates (this is %s)"), "v" .. tostring(runningVersion()))
+            end,
+            callback = function()
+                local waiting = installedNotRunning()
+                if waiting then
+                    offerRestart(waiting)
+                else
+                    self:checkForUpdate()
+                end
+            end,
+        },
+        {
+            text = _("Install updates automatically"),
+            help_text = _("After a sync, at most once a day, the plugin asks GitHub for a newer version and installs it; the new version runs after KOReader has been restarted. Only when the device is online for the sync anyway: Wi-Fi is never turned on for this.\n\nEach update is checked before anything is replaced (complete download, checksum, readable files, the right version), and the version it replaces is kept: \"Restore the previous version\" puts it back."),
+            checked_func = function()
+                return ZoteroAPI.getSettings():readSetting("update_auto") ~= false
+            end,
+            callback = function()
+                local settings = ZoteroAPI.getSettings()
+                settings:saveSetting("update_auto", settings:readSetting("update_auto") == false)
+                ZoteroAPI.saveSettingsToFile()
+            end,
+        },
+        {
+            text_func = function()
+                local previous = Update.previousVersion(updateDir())
+                return previous and string.format(_("Restore the previous version (%s)"), "v" .. previous)
+                    or _("Restore the previous version")
+            end,
+            enabled_func = function()
+                return Update.previousVersion(updateDir()) ~= nil
+            end,
+            callback = function()
+                local previous = Update.previousVersion(updateDir())
+                local ConfirmBox = require("ui/widget/confirmbox")
+                UIManager:show(ConfirmBox:new({
+                    text = string.format(_("Put version %s back? Automatic updates leave out the version installed now until a newer one comes."), "v" .. tostring(previous)),
+                    ok_text = _("Restore"),
+                    ok_callback = function()
+                        local ok, err = Update.restore(self.path, updateDir())
+                        if not ok then
+                            UIManager:show(InfoMessage:new({ text = _("The previous version could not be restored:") .. "\n" .. tostring(err), icon = "notice-warning" }))
+                            return
+                        end
+                        local settings = ZoteroAPI.getSettings()
+                        -- (the version that was replaced is not installed again automatically)
+                        settings:saveSetting("update_skip", installedNotRunning() or runningVersion())
+                        settings:saveSetting("update_installed", previous)
+                        ZoteroAPI.saveSettingsToFile()
+                        UIManager:askForRestart(string.format(_("Version %s is back in place. It runs after KOReader has been restarted."), "v" .. tostring(previous)))
+                    end,
+                }))
+            end,
+        },
+    }
+end
+
 function Plugin:runSync(fn)
     if syncBusy() then
         UIManager:show(InfoMessage:new({
@@ -637,7 +1056,7 @@ function Plugin:syncOpenDocumentAnnotations()
     end
     if not AnnotationSync.kindOf(file_path) then
         UIManager:show(InfoMessage:new({
-            text = _("Annotation sync supports PDF and EPUB documents."),
+            text = _("Annotation sync supports PDF, EPUB and web snapshots."),
             timeout = 4,
             icon = "notice-warning",
         }))
@@ -747,6 +1166,8 @@ function Plugin:initAPI()
     -- the reader's highlight colours: Zotero's set, readable on this screen
     Colors.init(ZoteroAPI.getSettings())
     Colors.apply()
+    -- a way out of the popup that follows a selection
+    Highlight.install(ZoteroAPI.getSettings())
     -- highlights without a colour of their own are sent with the reader's default colour
     Annotations.setDefaultColor(G_reader_settings:readSetting("highlight_color") or "yellow")
 end
@@ -917,9 +1338,26 @@ function Plugin:getZoteroSubMenu()
                         end,
                     },
                     {
+                        text = _("Profile per kind of document"),
+                        help_text = _("One of KOReader's profiles (Tools > Profiles) for PDFs, one for EPUBs, one for web snapshots: its settings - font, margins, line spacing, zoom and so on - are applied when a Zotero document of that kind is opened. A document takes the profile once, and again after the profile has been changed; what you adjust in a single document in between stays. Other books are not affected."),
+                        sub_item_table_func = function()
+                            return self:getTypeProfileMenu()
+                        end,
+                    },
+                    {
                         text = _("Highlight colours"),
                         sub_item_table_func = function()
                             return self:getColorMenu()
+                        end,
+                    },
+                    {
+                        text = _("\"Discard\" in the popup after selecting text"),
+                        help_text = _("When KOReader is set to highlight a selection at once and to ask for the colour or style (Long-press on text: \"Highlight action: Highlight\" and a \"Highlight prompt\"), the list that pops up gets one more button: Discard. It drops the selection without highlighting anything, for a selection that went wrong. A tap beside the list still highlights in the current colour, as before.\n\nThis is the reader's popup, so it applies to every document."),
+                        enabled_func = function() return Highlight.available() end,
+                        checked_func = function() return Highlight.enabled() end,
+                        callback = function()
+                            Highlight.setEnabled(not Highlight.enabled())
+                            ZoteroAPI.saveSettingsToFile()
                         end,
                     },
                     {
@@ -1058,6 +1496,15 @@ function Plugin:getZoteroSubMenu()
                         },
                     },
                 },
+            },
+            {
+                text_func = function()
+                    local waiting = installedNotRunning()
+                    return waiting and string.format(_("Updates (%s waits for a restart)"), "v" .. waiting) or _("Updates")
+                end,
+                sub_item_table_func = function()
+                    return self:getUpdateMenu()
+                end,
             },
             {
                 text = _("About/Info"),
@@ -1650,7 +2097,18 @@ function Plugin:onZoteroSyncAction()
             lines[#lines + 1] = readableStatus(e)
         end
         for i = 1, #(summary or {}) do lines[#lines + 1] = summary[i] end
+        -- a new version of the plugin, while the network is up
+        if e == nil then
+            local okc, note = pcall(self.autoUpdate, self, progress)
+            if not okc then logger.warn("Zotero: update check failed:", tostring(note)) end
+            if okc and note then lines[#lines + 1] = note end
+        end
         Trapper:info(table.concat(lines, "\n"))
+        if self.restart_for then
+            local version = self.restart_for
+            self.restart_for = nil
+            UIManager:nextTick(function() offerRestart(version) end)
+        end
     end)
 end
 function Plugin:onZoteroReanalyzeAction()

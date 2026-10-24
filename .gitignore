@@ -1,0 +1,4 @@
+dist/
+notes.md
+*.update-part
+.DS_Store

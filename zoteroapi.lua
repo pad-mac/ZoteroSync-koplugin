@@ -12,7 +12,7 @@ local Util = require("zotero_util")
 local _ = require("gettext")
 local DocSettings = require("docsettings")
 
-local API = { version = "Zotero Atelier 2.0 fork v0.8.1 (2026-10-03)", fork = "0.6" }
+local API = { version = "Zotero Atelier 2.0 fork v0.12 (2026-10-24)", fork = "0.6" }
 -- what a sync that the user stopped reports
 API.CANCELLED = "Sync stopped."
 local ZOTERO_BASE_URL = "https://api.zotero.org"
@@ -1252,6 +1252,34 @@ function API.pickAttachment(key)
     if best==1 then return usable[1],usable end
     return nil,usable
 end
+--- For the browser: the kind of file a tap on this entry opens, and whether
+-- that file is on this device (every one of them, where the entry has several
+-- of that kind and asks which). A copy that is older than Zotero's counts as
+-- not there, as it does when the entry is opened.
+-- @param standalone the entry is itself an attachment
+-- @return kind ("pdf" | "epub" | "html") or nil, on this device?
+function API.entryFileState(key, standalone)
+    local candidates={}
+    if standalone then
+        local item=API.getItem(key)
+        local kind=item and item.data and API.attachmentKind(item.data)
+        if not kind then return nil,false end
+        candidates[1]={item=item,kind=kind}
+    else
+        local list=API.getItemAttachments(key) or {}
+        local best=list[1] and list[1].kind
+        if not best then return nil,false end
+        for __,a in ipairs(list) do
+            if a.kind==best then candidates[#candidates+1]={item=API.getItem(a.key),kind=best} end
+        end
+    end
+    local kind=candidates[1].kind
+    for __,c in ipairs(candidates) do
+        local p=c.item and API.resolveAttachmentPath(c.item,true)
+        if not (p and file_exists(p)) then return kind,false end
+    end
+    return kind,true
+end
 function API.getItemWithAttachments(key)
     local item=API.getItem(key); if not item then return nil end
     local list=API.getItemAttachments(key); local attachments={}
@@ -1259,22 +1287,29 @@ function API.getItemWithAttachments(key)
     item.attachments=attachments; return item
 end
 
+local function is_child(d)
+    return type(d.parentItem)=="string" and d.parentItem~=""
+end
 function API.displayCollection(key)
     key=key or "/"; local db=API.openDB(); local out={}
     local cid=tonumber(db:rowexec("SELECT collectionID FROM collections WHERE key='"..key:gsub("'","''").."'")); if not cid then return out end
-    local st=db:prepare("SELECT key,collectionName FROM collections WHERE parentCollectionID=? ORDER BY collectionName COLLATE NOCASE"); local row=st:bind(cid):step()
-    while row do table.insert(out,{key=row[1],text=(row[2] or "").."/",type="collection"}); row=st:step(row) end; st:close()
+    local st=db:prepare("SELECT key,collectionName,synced FROM collections WHERE parentCollectionID=? ORDER BY collectionName COLLATE NOCASE"); local row=st:bind(cid):step()
+    -- (offline: a collection whose files a sync downloads)
+    while row do table.insert(out,{key=row[1],text=row[2] or "",type="collection",offline=(tonumber(row[3]) or 0)>0}); row=st:step(row) end; st:close()
     st=db:prepare([[SELECT i.key,d.value,t.typeName FROM collectionItems ci JOIN items i ON i.itemID=ci.itemID JOIN itemData d ON d.itemID=i.itemID JOIN itemTypes t ON t.itemTypeID=i.itemTypeID WHERE ci.collectionID=? AND t.typeName NOT IN ('annotation')]])
     row=st:bind(cid):step()
     while row do
         local item=safe_decode(row[2]); local d=item and item.data or {}; local meta=item and item.meta or {}; local text=d.title or d.filename or row[1]; if meta.creatorSummary and meta.creatorSummary~="" then text=meta.creatorSummary.." - "..text end
-        local tp=row[3]=="attachment" and "attachment" or "item"; table.insert(out,{key=row[1],text=text,type=tp,is_pdf=d.contentType=="application/pdf"}); row=st:step(row)
+        -- (the files, links and notes of an entry belong to no collection of
+        -- their own and are stored under the top level: they are reached
+        -- through their entry, not listed beside it)
+        local tp=row[3]=="attachment" and "attachment" or "item"; if not is_child(d) then table.insert(out,{key=row[1],text=text,type=tp,is_pdf=d.contentType=="application/pdf"}) end; row=st:step(row)
     end
     st:close(); return out
 end
 function API.displaySearchResults(query)
     query=string.lower(query or ""); local db=API.openDB(); local out={}; local st=db:prepare([[SELECT i.key,d.value,t.typeName FROM items i JOIN itemData d USING(itemID) JOIN itemTypes t USING(itemTypeID) WHERE t.typeName NOT IN ('annotation')]])
-    local row=st:reset():step(); while row do local item=safe_decode(row[2]); local d=item and item.data or {}; local meta=item and item.meta or {}; local text=d.title or d.filename or row[1]; if meta.creatorSummary and meta.creatorSummary~="" then text=meta.creatorSummary.." - "..text end; if query=="" or string.lower(text):find(query,1,true) then table.insert(out,{key=row[1],text=text,type=row[3]=="attachment" and "attachment" or "item"}) end; row=st:step(row) end; st:close(); table.sort(out,function(a, b) return a.text<b.text end); return out
+    local row=st:reset():step(); while row do local item=safe_decode(row[2]); local d=item and item.data or {}; local meta=item and item.meta or {}; local text=d.title or d.filename or row[1]; if meta.creatorSummary and meta.creatorSummary~="" then text=meta.creatorSummary.." - "..text end; if (query=="" or string.lower(text):find(query,1,true)) and not is_child(d) then table.insert(out,{key=row[1],text=text,type=row[3]=="attachment" and "attachment" or "item"}) end; row=st:step(row) end; st:close(); table.sort(out,function(a, b) return a.text<b.text end); return out
 end
 
 function API.getAttachmentVersion(key)
@@ -1352,6 +1387,68 @@ function API.markAttachmentPresent(key)
         WHERE syncedVersion<=0 AND itemID IN (SELECT itemID FROM items WHERE key=?)]])
     st:bind(key):step(); st:close()
 end
+--- A web snapshot, before KOReader opens it.
+-- KOReader's engine ends a tag at the first ">" even inside a quoted
+-- attribute value, and saved pages are full of those (the inline document of
+-- every frame, pictures written as markup): what follows is shown as text, or
+-- the rest of the page is not shown at all. The plugin's copy of the page is
+-- rewritten so that the engine reads it as a browser does (zotero_html.lua,
+-- engineCopy: the tree Zotero builds from it stays the same, which is checked).
+-- Never touched: a linked file, a file in Zotero's own storage folder, the
+-- document that is open, and a copy that already carries highlights made in
+-- KOReader on the page as the engine read it before.
+-- @return true when the file was rewritten
+function API.prepareSnapshot(path)
+    if type(path) ~= "string" or not API.storage_dir or path:sub(1, #API.storage_dir + 1) ~= API.storage_dir .. "/" then return false end
+    local size = lfs.attributes(path, "size")
+    if not size or size == 0 then return false end
+    local ds = DocSettings:open(path)
+    local checked = ds:readSetting("zotero_snapshot_checked")
+    if checked == size then return false end
+    local ReaderUI = package.loaded["apps/reader/readerui"]
+    local open_doc = ReaderUI and ReaderUI.instance and ReaderUI.instance.document
+    if open_doc and open_doc.file == path then return false end
+    local anns = ds:readSetting("annotations")
+    if checked == nil and type(anns) == "table" and next(anns) ~= nil then return false end
+    local f = io.open(path, "rb"); if not f then return false end
+    local src = f:read("*a"); f:close()
+    if type(src) ~= "string" then return false end
+    local Html = require("zotero_html")
+    local copy, n = Html.engineCopy(src)
+    local rewritten = false
+    if copy then
+        local part = path .. ".part"
+        local out = io.open(part, "wb")
+        if out then
+            local wrote = out:write(copy); out:close()
+            if wrote and os.rename(part, path) then
+                rewritten = true
+                size = lfs.attributes(path, "size") or #copy
+                logger.info("Zotero: snapshot rewritten for the reading engine:", path, n, "attribute values")
+                -- where the page was last read was a place in the page as it was read before
+                if ds:has("last_xpointer") then
+                    local share = tonumber(ds:readSetting("percent_finished"))
+                    ds:delSetting("last_xpointer")
+                    if share then ds:saveSetting("last_percent", share) end
+                end
+            else
+                os.remove(part)
+                return false
+            end
+        else
+            return false
+        end
+    elseif n then
+        logger.info("Zotero: snapshot left as it is:", path, tostring(n))
+    end
+    ds:saveSetting("zotero_snapshot_checked", size); ds:flush()
+    return rewritten
+end
+local function prepare_snapshot(path)
+    local ok, err = pcall(API.prepareSnapshot, path)
+    if not ok then logger.warn("Zotero: snapshot not prepared:", tostring(path), tostring(err)) end
+end
+
 function API.downloadAndGetPath(key, download_callback)
     local item=API.getItem(key); if not item then return nil,"Error: the requested file can not be found in the database" end
     if not item.data or item.data.itemType~="attachment" then return nil,"Error: this item is not an attachment" end
@@ -1359,6 +1456,7 @@ function API.downloadAndGetPath(key, download_callback)
     if not kind then return nil,API.whyNotOpenable(item.data) end
     local local_path=API.resolveAttachmentPath(item)
     if local_path and file_exists(local_path) then
+        if kind=="html" then prepare_snapshot(local_path) end
         API.getAttachmentInfo(item,local_path); API.markAttachmentPresent(key)
         return local_path,nil
     end
@@ -1394,6 +1492,7 @@ function API.downloadAndGetPath(key, download_callback)
             if not os.rename(part,path) then os.remove(part); return nil,"Could not store attachment file" end
         end
     end
+    if kind=="html" then prepare_snapshot(path) end
     API.getAttachmentInfo(item,path)
     API.setAttachmentVersionByKey(key,math.max(1,tonumber(item.version) or 1)); return path,nil
 end
