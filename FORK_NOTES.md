@@ -28,10 +28,10 @@ https://github.com/pad-mac/ZoteroSync-koplugin.
 * Automatic updates can be switched off: Updates > Install updates
   automatically.
 
-Publishing: a tag `v0.13` pushed to the repository makes a GitHub workflow
-check the version in `zoteroapi.lua` against the tag, compile every Lua file,
-package `zoteroatelier.koplugin.zip` and publish it as a release, with the
-section of these notes for that version as release notes.
+Publishing: when a push to `main` changes the version in `zoteroapi.lua`, a
+GitHub workflow compiles every Lua file, packages
+`zoteroatelier.koplugin.zip` and publishes it as release `v<version>`, with
+the section of these notes for that version as release notes.
 
 ## v0.11 — "Discard" in the popup after a selection
 

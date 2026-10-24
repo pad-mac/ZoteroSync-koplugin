@@ -44,10 +44,12 @@ want by hand as described above.
 
 1. Set the version in `zoteroapi.lua` (`fork v0.13 (date)`) and add a
    `## v0.13 …` section at the top of `FORK_NOTES.md`.
-2. Commit, then tag and push: `git tag v0.13 && git push origin main v0.13`.
-3. The workflow in `.github/workflows/release.yml` checks the version and
-   that every Lua file compiles, and publishes the release with the zip.
-   Devices pick it up after their next sync.
+2. Commit and push to `main`.
+3. The workflow in `.github/workflows/release.yml` sees the new version,
+   checks that every Lua file compiles, and publishes release `v0.13` with
+   the zip and that section of the notes. Devices pick it up after their
+   next sync. (A version that already has a release is left alone; pushing a
+   tag `v0.13` or running the workflow by hand works too.)
 
 ## Credits and licence
 

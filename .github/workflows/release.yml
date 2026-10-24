@@ -1,31 +1,53 @@
-# A tag "v0.13" publishes version 0.13: the plugin's folder as a zip, attached
-# to a GitHub release. The plugin's updater (zotero_update.lua) looks for
-# exactly that file in the latest release.
+# Publishes the version that zoteroapi.lua names ("fork v0.13") as a GitHub
+# release, with the plugin's folder as zoteroatelier.koplugin.zip attached:
+# the file the plugin's updater (zotero_update.lua) looks for.
+#
+# Runs when main changes the version (or this workflow), when a tag v… is
+# pushed, or by hand (Actions > Release > Run workflow). A version that has a
+# release already is left alone, so bumping the version in zoteroapi.lua and
+# pushing to main is all a release takes.
 name: Release
 
 on:
   push:
+    branches: [main]
+    paths: ["zoteroapi.lua", ".github/workflows/release.yml"]
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: The version in zoteroapi.lua must be the tag's
+      - name: Which version
+        id: version
         run: |
-          tag="${GITHUB_REF_NAME#v}"
-          inside="$(grep -o 'fork v[0-9][0-9.]*' zoteroapi.lua | head -1 | sed 's/^fork v//')"
-          if [ "$tag" != "$inside" ]; then
-            echo "::error::The tag is v$tag but zoteroapi.lua says v$inside"
-            exit 1
+          version="$(grep -o 'fork v[0-9][0-9.]*' zoteroapi.lua | head -1 | sed 's/^fork v//')"
+          if [ -z "$version" ]; then echo "::error::No version (fork v…) found in zoteroapi.lua"; exit 1; fi
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v$version" ]; then
+            echo "::error::The tag is ${GITHUB_REF_NAME} but zoteroapi.lua says v$version"; exit 1
+          fi
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "v$version has a release already: nothing to do."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Every Lua file must compile
+        if: steps.version.outputs.exists == 'false'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq luajit > /dev/null
@@ -43,6 +65,7 @@ jobs:
           luajit "$RUNNER_TEMP/compile.lua" *.lua
 
       - name: Package the plugin's folder
+        if: steps.version.outputs.exists == 'false'
         run: |
           mkdir -p dist/zoteroatelier.koplugin
           cp *.lua LICENSE FORK_NOTES.md dist/zoteroatelier.koplugin/
@@ -50,19 +73,22 @@ jobs:
           unzip -l dist/zoteroatelier.koplugin.zip
 
       - name: Release notes from FORK_NOTES.md
+        if: steps.version.outputs.exists == 'false'
         run: |
-          awk -v v="## ${GITHUB_REF_NAME}" '
+          tag="${{ steps.version.outputs.tag }}"
+          awk -v v="## $tag" '
             ($0 == v || index($0, v " ") == 1) { on = 1; next }
             on && /^## / { exit }
             on { print }
-          ' FORK_NOTES.md > notes.md
-          if [ ! -s notes.md ]; then echo "${GITHUB_REF_NAME}" > notes.md; fi
+          ' FORK_NOTES.md | sed '/./,$!d' > notes.md
+          if [ ! -s notes.md ]; then echo "$tag" > notes.md; fi
           cat notes.md
 
       - name: Publish
-        env:
-          GH_TOKEN: ${{ github.token }}
+        if: steps.version.outputs.exists == 'false'
         run: |
-          title="$(grep -m1 "^## ${GITHUB_REF_NAME}" FORK_NOTES.md | sed 's/^## //')"
-          gh release create "$GITHUB_REF_NAME" dist/zoteroatelier.koplugin.zip \
-            --title "${title:-$GITHUB_REF_NAME}" --notes-file notes.md
+          tag="${{ steps.version.outputs.tag }}"
+          title="$(grep -m1 "^## $tag" FORK_NOTES.md | sed 's/^## //')"
+          gh release create "$tag" dist/zoteroatelier.koplugin.zip \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "${title:-$tag}" --notes-file notes.md
